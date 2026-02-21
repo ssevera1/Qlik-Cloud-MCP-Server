@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "qlik-mcp-server"
+version = "0.1.0"
+description = "Model Context Protocol server exposing Qlik Cloud capabilities to AI agents"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.0.0",
+    "websockets>=12.0",
+    "httpx>=0.27.0",
+    "pyyaml>=6.0.1",
+    "pydantic>=2.5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-mock>=3.12.0",
+]
+sse = [
+    "uvicorn>=0.27.0",
+    "starlette>=0.36.0",
+]
+
+[project.scripts]
+qlik-mcp-server = "qlik_mcp_server.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "integration: requires live Qlik Cloud tenant",
+]
