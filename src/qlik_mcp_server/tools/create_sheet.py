@@ -18,6 +18,14 @@ from ..engine_client import EngineClient, EngineError
 logger = logging.getLogger(__name__)
 
 
+_ALLOWED_VIS_TYPES = frozenset({
+    "barchart", "linechart", "piechart", "table", "kpi",
+    "scatterplot", "treemap", "combochart", "gauge", "waterfallchart",
+    "boxplot", "distributionplot", "histogram", "map", "pivot-table",
+    "text-image", "filterpane",
+})
+
+
 class VisualizationObject(BaseModel):
     """Definition for a visualization to add to the sheet."""
 
@@ -29,15 +37,18 @@ class VisualizationObject(BaseModel):
     )
     title: str = Field(
         default="",
-        description="Title for the visualization"
+        description="Title for the visualization",
+        max_length=512,
     )
     dimensions: list[str] = Field(
         default_factory=list,
-        description="Field names for dimensions (e.g., ['Region', 'Product'])"
+        description="Field names for dimensions (e.g., ['Region', 'Product'])",
+        max_length=20,
     )
     measures: list[str] = Field(
         default_factory=list,
-        description="Aggregation expressions (e.g., ['Sum(Revenue)', 'Count(OrderID)'])"
+        description="Aggregation expressions (e.g., ['Sum(Revenue)', 'Count(OrderID)'])",
+        max_length=30,
     )
 
 
@@ -59,7 +70,8 @@ class CreateSheetInput(BaseModel):
         description=(
             "List of visualization objects to add to the sheet. "
             "Each object defines a chart type, dimensions, and measures."
-        )
+        ),
+        max_length=50,
     )
 
 
@@ -87,6 +99,15 @@ async def handle_create_sheet(
         }
 
     input_data = CreateSheetInput(**params)
+
+    # Validate visualization types
+    for obj in input_data.objects:
+        if obj.type not in _ALLOWED_VIS_TYPES:
+            return {
+                "error": f"Invalid visualization type: '{obj.type}'",
+                "allowed_types": sorted(_ALLOWED_VIS_TYPES),
+                "app_id": input_data.app_id,
+            }
 
     # Prefix the title
     prefixed_title = f"{sheet_prefix}{input_data.title}"

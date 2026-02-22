@@ -6,8 +6,10 @@ data retrieval, sheet inspection, and sheet creation.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Optional
@@ -18,7 +20,26 @@ from websockets.asyncio.client import connect as ws_connect
 from .auth import AuthManager
 from .config import Config
 
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+# Maximum time (seconds) to wait for a single WebSocket response
+_WS_RECV_TIMEOUT = 120
+
 logger = logging.getLogger(__name__)
+
+
+def _validate_id(value: str, label: str = "ID") -> str:
+    """Validate that a value looks like a Qlik object identifier (UUID).
+
+    Raises EngineError if the value is not a valid UUID, preventing
+    path-traversal or injection via WebSocket URL construction.
+    """
+    if not value or not _UUID_RE.match(value):
+        raise EngineError(f"Invalid {label}: expected UUID format")
+    return value
 
 
 class EngineError(Exception):
@@ -105,9 +126,17 @@ class EngineSession:
 
         await self._ws.send(json.dumps(msg))
 
-        # Read responses until we get the one matching our request ID
+        # Read responses until we get the one matching our request ID.
+        # Apply a timeout to prevent indefinite blocking.
         while True:
-            raw = await self._ws.recv()
+            try:
+                raw = await asyncio.wait_for(
+                    self._ws.recv(), timeout=_WS_RECV_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                raise EngineError(
+                    f"Engine request timed out after {_WS_RECV_TIMEOUT}s"
+                )
             response = json.loads(raw)
             if response.get("id") == request_id:
                 if "error" in response:
@@ -435,6 +464,9 @@ class EngineClient:
             async with engine_client.open_app("app-id") as session:
                 sheets = await session.get_sheets()
         """
+        # Validate app_id is a UUID to prevent SSRF / path traversal
+        _validate_id(app_id, "app_id")
+
         tenant_host = self.config.tenant_host
         ws_url = f"wss://{tenant_host}/app/{app_id}"
         headers = await self.auth.get_ws_headers()

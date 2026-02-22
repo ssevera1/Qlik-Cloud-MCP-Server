@@ -93,6 +93,11 @@ class TestConfigValidation:
         assert any("https://" in e for e in errors)
 
 
+    def test_sse_default_host_is_localhost(self):
+        config = Config()
+        assert config.server.sse_host == "127.0.0.1"
+
+
 class TestConfigProperties:
     def test_auth_mode_api_key(self):
         config = Config()

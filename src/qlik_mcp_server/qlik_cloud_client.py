@@ -7,12 +7,18 @@ and space listing via the Qlik Cloud REST API.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Optional
 
 import httpx
 
 from .auth import AuthManager
 from .config import Config
+
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -72,8 +78,12 @@ class QlikCloudClient:
                     continue
 
                 if response.status_code >= 400:
+                    logger.debug(
+                        "Qlik Cloud API error response (%d): %s",
+                        response.status_code, response.text[:500],
+                    )
                     raise QlikCloudError(
-                        f"Qlik Cloud API error: {response.status_code} - {response.text}",
+                        f"Qlik Cloud API request failed (HTTP {response.status_code})",
                         status_code=response.status_code,
                     )
 
@@ -138,6 +148,8 @@ class QlikCloudClient:
 
     async def get_app(self, app_id: str) -> dict:
         """Get metadata for a specific app."""
+        if not _UUID_RE.match(app_id):
+            raise QlikCloudError("Invalid app_id: expected UUID format")
         result = await self._request("GET", f"/api/v1/apps/{app_id}")
         if not result:
             raise QlikCloudError(f"App not found: {app_id}", status_code=404)
@@ -174,6 +186,8 @@ class QlikCloudClient:
 
     async def get_app_objects(self, app_id: str) -> list[dict]:
         """Get objects (sheets, bookmarks) for an app via REST."""
+        if not _UUID_RE.match(app_id):
+            raise QlikCloudError("Invalid app_id: expected UUID format")
         result = await self._request(
             "GET", f"/api/v1/apps/{app_id}/objects",
             params={"limit": 100},

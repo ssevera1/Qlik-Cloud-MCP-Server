@@ -65,6 +65,17 @@ class AuthManager:
         if not token_url:
             token_url = f"{self.config.qlik.tenant_url}/oauth/token"
 
+        # Validate token_url is under the tenant domain to prevent SSRF
+        tenant_host = self.config.tenant_host
+        from urllib.parse import urlparse
+        parsed = urlparse(token_url)
+        if parsed.scheme != "https":
+            raise AuthError("token_url must use HTTPS")
+        if not parsed.hostname or not parsed.hostname.endswith(tenant_host):
+            raise AuthError(
+                "token_url must be under the configured tenant domain"
+            )
+
         logger.debug("Refreshing OAuth2 token from %s", token_url)
 
         async with httpx.AsyncClient(timeout=30) as client:
@@ -79,9 +90,12 @@ class AuthManager:
             )
 
             if response.status_code != 200:
+                logger.debug(
+                    "OAuth2 token response (%d): %s",
+                    response.status_code, response.text[:500],
+                )
                 raise AuthError(
-                    f"OAuth2 token request failed ({response.status_code}): "
-                    f"{response.text}"
+                    f"OAuth2 token request failed (HTTP {response.status_code})"
                 )
 
             data = response.json()

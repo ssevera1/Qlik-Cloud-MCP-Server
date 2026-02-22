@@ -20,8 +20,11 @@ logger = logging.getLogger(__name__)
 class Filter(BaseModel):
     """A field selection/filter to apply before data retrieval."""
 
-    field: str = Field(description="The field name to filter on")
-    values: list[str] = Field(description="Values to select in the field")
+    field: str = Field(description="The field name to filter on", min_length=1, max_length=256)
+    values: list[str] = Field(
+        description="Values to select in the field",
+        min_length=1, max_length=1000,
+    )
 
 
 class GetHypercubeDataInput(BaseModel):
@@ -34,13 +37,15 @@ class GetHypercubeDataInput(BaseModel):
         description=(
             "List of field names or expressions for the dimensions (grouping columns). "
             "Example: ['Region', 'Product Category']"
-        )
+        ),
+        min_length=1, max_length=20,
     )
     measures: list[str] = Field(
         description=(
             "List of aggregation expressions for the measures (computed values). "
             "Example: ['Sum(Revenue)', 'Count(OrderID)', 'Avg(UnitPrice)']"
-        )
+        ),
+        min_length=1, max_length=30,
     )
     filters: Optional[list[Filter]] = Field(
         default=None,
@@ -48,7 +53,7 @@ class GetHypercubeDataInput(BaseModel):
             "Optional filters to apply before retrieving data. "
             "Each filter selects specific values in a field. "
             "Example: [{field: 'Year', values: ['2025']}, {field: 'Region', values: ['East', 'West']}]"
-        )
+        ),
     )
     max_rows: Optional[int] = Field(
         default=1000,
@@ -66,13 +71,26 @@ TOOL_DESCRIPTION = (
 
 
 async def handle_get_hypercube_data(
-    engine: EngineClient, params: dict, max_rows_limit: int = 10000
+    engine: EngineClient, params: dict,
+    max_rows_limit: int = 10000,
+    max_columns_limit: int = 50,
 ) -> dict:
     """Execute the qlik_get_hypercube_data tool."""
     input_data = GetHypercubeDataInput(**params)
 
     # Enforce row limit
     effective_max = min(input_data.max_rows or 1000, max_rows_limit)
+
+    # Enforce column limit
+    total_columns = len(input_data.dimensions) + len(input_data.measures)
+    if total_columns > max_columns_limit:
+        return {
+            "error": (
+                f"Too many columns ({total_columns}). "
+                f"Maximum allowed: {max_columns_limit}."
+            ),
+            "app_id": input_data.app_id,
+        }
 
     try:
         async with engine.open_app(input_data.app_id) as session:

@@ -10,11 +10,16 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from ..qlik_cloud_client import QlikCloudClient, QlikCloudError
 
 logger = logging.getLogger(__name__)
+
+_VALID_RESOURCE_TYPES = frozenset({
+    "app", "dataset", "automation", "note", "dataconnection",
+    "genericlink", "sharingservicetask", "insight",
+})
 
 
 class SearchInput(BaseModel):
@@ -34,6 +39,16 @@ class SearchInput(BaseModel):
             "'automation', 'note', or omit for all types"
         )
     )
+
+    @field_validator("resource_type")
+    @classmethod
+    def validate_resource_type(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in _VALID_RESOURCE_TYPES:
+            raise ValueError(
+                f"Invalid resource_type '{v}'. "
+                f"Allowed: {', '.join(sorted(_VALID_RESOURCE_TYPES))}"
+            )
+        return v
     space: Optional[str] = Field(
         default=None,
         description="Filter by space ID to search within a specific space"

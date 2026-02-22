@@ -67,7 +67,7 @@ class QlikConfig:
 @dataclass
 class ServerConfig:
     transport: str = "stdio"
-    sse_host: str = "0.0.0.0"
+    sse_host: str = "127.0.0.1"
     sse_port: int = 8080
     log_level: str = "INFO"
 

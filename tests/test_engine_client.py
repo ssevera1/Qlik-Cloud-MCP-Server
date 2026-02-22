@@ -4,7 +4,33 @@ import json
 
 import pytest
 
-from qlik_mcp_server.engine_client import EngineSession, HypercubeResult
+from qlik_mcp_server.engine_client import EngineError, EngineSession, HypercubeResult, _validate_id
+
+
+class TestAppIdValidation:
+    def test_valid_uuid(self):
+        result = _validate_id("a1b2c3d4-e5f6-7890-abcd-ef1234567890", "app_id")
+        assert result == "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+
+    def test_valid_uuid_uppercase(self):
+        result = _validate_id("A1B2C3D4-E5F6-7890-ABCD-EF1234567890", "app_id")
+        assert result == "A1B2C3D4-E5F6-7890-ABCD-EF1234567890"
+
+    def test_rejects_empty(self):
+        with pytest.raises(EngineError, match="Invalid app_id"):
+            _validate_id("", "app_id")
+
+    def test_rejects_path_traversal(self):
+        with pytest.raises(EngineError, match="Invalid app_id"):
+            _validate_id("../../etc/passwd", "app_id")
+
+    def test_rejects_url_injection(self):
+        with pytest.raises(EngineError, match="Invalid app_id"):
+            _validate_id("evil.com/steal?data=1", "app_id")
+
+    def test_rejects_non_uuid_string(self):
+        with pytest.raises(EngineError, match="Invalid app_id"):
+            _validate_id("my-app-name", "app_id")
 
 
 class TestHypercubeResult:

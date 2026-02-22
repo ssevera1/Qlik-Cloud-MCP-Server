@@ -106,8 +106,18 @@ def create_server(config: Config) -> Server:
 
         except Exception as e:
             logger.error("Tool %s failed: %s", name, e, exc_info=True)
+            # Return a sanitized error — do not leak internal details
+            from .engine_client import EngineError
+            from .qlik_cloud_client import QlikCloudError
+            from .auth import AuthError
+            if isinstance(e, (EngineError, QlikCloudError)):
+                safe_msg = str(e)
+            elif isinstance(e, AuthError):
+                safe_msg = "Authentication failed"
+            else:
+                safe_msg = "An internal error occurred"
             error_result = json.dumps({
-                "error": str(e),
+                "error": safe_msg,
                 "tool": name,
                 "hint": "Check the server logs for details.",
             })
@@ -125,6 +135,20 @@ async def _dispatch_tool(
 ) -> dict:
     """Route a tool call to the appropriate handler."""
 
+    # Map tool names to their enabled flags
+    _tool_enabled = {
+        "qlik_get_sheet_details": config.tools.get_sheet_details,
+        "qlik_get_hypercube_data": config.tools.get_hypercube_data,
+        "qlik_create_sheet": config.tools.create_sheet,
+        "qlik_search": config.tools.search,
+    }
+
+    if name not in _tool_enabled:
+        return {"error": f"Unknown tool: {name}"}
+
+    if not _tool_enabled[name]:
+        return {"error": f"Tool '{name}' is disabled in server configuration."}
+
     if name == "qlik_get_sheet_details":
         return await handle_get_sheet_details(engine_client, arguments)
 
@@ -132,6 +156,7 @@ async def _dispatch_tool(
         return await handle_get_hypercube_data(
             engine_client, arguments,
             max_rows_limit=config.tools.max_hypercube_rows,
+            max_columns_limit=config.tools.max_hypercube_columns,
         )
 
     elif name == "qlik_create_sheet":
@@ -144,8 +169,7 @@ async def _dispatch_tool(
     elif name == "qlik_search":
         return await handle_search(qlik_client, arguments)
 
-    else:
-        return {"error": f"Unknown tool: {name}"}
+    return {"error": f"Unknown tool: {name}"}
 
 
 async def run_stdio_server(config: Config) -> None:

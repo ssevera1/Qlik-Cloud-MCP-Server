@@ -58,6 +58,22 @@ class TestGetHypercubeDataInput:
         with pytest.raises(ValidationError):
             GetHypercubeDataInput(app_id="app1", dimensions=["X"])
 
+    def test_empty_dimensions_rejected(self):
+        with pytest.raises(ValidationError):
+            GetHypercubeDataInput(app_id="app1", dimensions=[], measures=["Sum(X)"])
+
+    def test_empty_measures_rejected(self):
+        with pytest.raises(ValidationError):
+            GetHypercubeDataInput(app_id="app1", dimensions=["X"], measures=[])
+
+    def test_empty_filter_field_rejected(self):
+        with pytest.raises(ValidationError):
+            Filter(field="", values=["val"])
+
+    def test_empty_filter_values_rejected(self):
+        with pytest.raises(ValidationError):
+            Filter(field="Year", values=[])
+
 
 class TestCreateSheetInput:
     def test_valid_basic(self):
@@ -116,3 +132,12 @@ class TestSearchInput:
     def test_missing_query(self):
         with pytest.raises(ValidationError):
             SearchInput()
+
+    def test_invalid_resource_type(self):
+        with pytest.raises(ValidationError):
+            SearchInput(query="test", resource_type="invalid_type")
+
+    def test_valid_resource_types(self):
+        for rt in ("app", "dataset", "automation", "note"):
+            inp = SearchInput(query="test", resource_type=rt)
+            assert inp.resource_type == rt
