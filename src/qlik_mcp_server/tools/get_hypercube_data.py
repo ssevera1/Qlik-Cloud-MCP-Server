@@ -57,6 +57,7 @@ class GetHypercubeDataInput(BaseModel):
     )
     max_rows: Optional[int] = Field(
         default=1000,
+        ge=1,
         description="Maximum number of rows to return (default: 1000, max: 10000)"
     )
 

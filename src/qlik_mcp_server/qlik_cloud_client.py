@@ -6,6 +6,7 @@ and space listing via the Qlik Cloud REST API.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from typing import Any, Optional
@@ -71,7 +72,10 @@ class QlikCloudClient:
                 )
 
                 if response.status_code == 429:
-                    retry_after = int(response.headers.get("Retry-After", "5"))
+                    try:
+                        retry_after = int(response.headers.get("Retry-After", "5"))
+                    except ValueError:
+                        retry_after = 5
                     logger.warning("Rate limited. Retrying in %ds...", retry_after)
                     import asyncio
                     await asyncio.sleep(retry_after)
@@ -88,7 +92,10 @@ class QlikCloudClient:
                     )
 
                 if response.content:
-                    return response.json()
+                    try:
+                        return response.json()
+                    except (json.JSONDecodeError, ValueError):
+                        return {"raw_content": response.text}
                 return None
 
             except httpx.TimeoutException:

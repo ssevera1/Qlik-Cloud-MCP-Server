@@ -5,6 +5,7 @@ Supports API key (bearer token) and OAuth2 M2M (client credentials grant).
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from typing import Optional
@@ -71,7 +72,10 @@ class AuthManager:
         parsed = urlparse(token_url)
         if parsed.scheme != "https":
             raise AuthError("token_url must use HTTPS")
-        if not parsed.hostname or not parsed.hostname.endswith(tenant_host):
+        if not parsed.hostname or (
+            parsed.hostname != tenant_host
+            and not parsed.hostname.endswith("." + tenant_host)
+        ):
             raise AuthError(
                 "token_url must be under the configured tenant domain"
             )
@@ -98,9 +102,14 @@ class AuthManager:
                     f"OAuth2 token request failed (HTTP {response.status_code})"
                 )
 
-            data = response.json()
+            try:
+                data = response.json()
+            except (json.JSONDecodeError, ValueError) as e:
+                raise AuthError(f"OAuth2 response is not valid JSON: {e}")
 
-        self._access_token = data["access_token"]
+        self._access_token = data.get("access_token")
+        if not self._access_token:
+            raise AuthError("OAuth2 response did not contain an access_token")
         expires_in = data.get("expires_in", 3600)
         self._token_expiry = time.time() + expires_in
 

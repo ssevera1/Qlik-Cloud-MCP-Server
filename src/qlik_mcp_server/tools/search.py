@@ -55,6 +55,7 @@ class SearchInput(BaseModel):
     )
     limit: Optional[int] = Field(
         default=20,
+        ge=1,
         description="Maximum number of results to return (default: 20, max: 40)"
     )
 

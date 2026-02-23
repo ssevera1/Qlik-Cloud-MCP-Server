@@ -40,7 +40,10 @@ def _resolve_dict(data: dict) -> dict:
             resolved[key] = _resolve_dict(value)
         elif isinstance(value, list):
             resolved[key] = [
-                _resolve_env_vars(v) if isinstance(v, str) else v for v in value
+                _resolve_env_vars(v) if isinstance(v, str)
+                else _resolve_dict(v) if isinstance(v, dict)
+                else v
+                for v in value
             ]
         else:
             resolved[key] = value
@@ -117,10 +120,10 @@ class Config:
 
         if "qlik" in data:
             qlik_data = data["qlik"]
-            oauth_data = qlik_data.pop("oauth", None)
+            oauth_data = qlik_data.get("oauth", None)
             config.qlik = QlikConfig(**{
                 k: v for k, v in qlik_data.items()
-                if k in QlikConfig.__dataclass_fields__
+                if k in QlikConfig.__dataclass_fields__ and k != "oauth"
             })
             if oauth_data:
                 config.qlik.oauth = OAuthConfig(**{

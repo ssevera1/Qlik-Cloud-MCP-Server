@@ -128,7 +128,12 @@ class EngineSession:
 
         # Read responses until we get the one matching our request ID.
         # Apply a timeout to prevent indefinite blocking.
+        max_iterations = 100
+        iterations = 0
         while True:
+            if iterations >= max_iterations:
+                raise EngineError(f"Timed out waiting for response to request {request_id} after {max_iterations} messages")
+            iterations += 1
             try:
                 raw = await asyncio.wait_for(
                     self._ws.recv(), timeout=_WS_RECV_TIMEOUT
@@ -137,7 +142,11 @@ class EngineSession:
                 raise EngineError(
                     f"Engine request timed out after {_WS_RECV_TIMEOUT}s"
                 )
-            response = json.loads(raw)
+            try:
+                response = json.loads(raw)
+            except json.JSONDecodeError:
+                logger.warning("Received non-JSON WebSocket message, skipping")
+                continue
             if response.get("id") == request_id:
                 if "error" in response:
                     err = response["error"]
@@ -473,12 +482,15 @@ class EngineClient:
 
         logger.debug("Connecting to Engine API: %s", ws_url)
 
-        ws = await ws_connect(
-            ws_url,
-            additional_headers=headers,
-            open_timeout=self.config.qlik.timeout_seconds,
-            close_timeout=10,
-        )
+        try:
+            ws = await ws_connect(
+                ws_url,
+                additional_headers=headers,
+                open_timeout=self.config.qlik.timeout_seconds,
+                close_timeout=10,
+            )
+        except Exception as e:
+            raise EngineError(f"Failed to connect to Engine API: {e}") from e
 
         try:
             # The doc handle for an opened app is conventionally -1 (global)
@@ -487,9 +499,12 @@ class EngineClient:
 
             # Open the document to get the doc handle
             result = await session._send("OpenDoc", -1, [app_id])
-            if result:
-                doc_handle = result.get("qReturn", {}).get("qHandle", 1)
-                session._doc_handle = doc_handle
+            if not result:
+                raise EngineError(f"Failed to open document: {app_id}")
+            doc_handle = result.get("qReturn", {}).get("qHandle")
+            if doc_handle is None:
+                raise EngineError(f"No document handle returned for: {app_id}")
+            session._doc_handle = doc_handle
 
             logger.debug("Engine session opened for app %s (handle=%d)", app_id, session._doc_handle)
             yield session
