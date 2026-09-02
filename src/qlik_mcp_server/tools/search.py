@@ -1,8 +1,8 @@
-"""qlik_search — Discover apps and data products across the catalog.
+"""qlik_search: discover apps and data products across the catalog.
 
-Enables the agent to traverse the entire catalog of apps and data
-products to find relevant assets, facilitating "Metric Discovery"
-across the enterprise.
+Enables the agent to traverse the catalog of apps, datasets, and data
+products to find relevant assets ("metric discovery") across the tenant.
+Reference: https://qlik.dev/apis/rest/items/
 """
 
 from __future__ import annotations
@@ -16,9 +16,12 @@ from ..qlik_cloud_client import QlikCloudClient, QlikCloudError
 
 logger = logging.getLogger(__name__)
 
+# resourceType values accepted by GET /api/v1/items (case-sensitive).
 _VALID_RESOURCE_TYPES = frozenset({
-    "app", "dataset", "automation", "note", "dataconnection",
-    "genericlink", "sharingservicetask", "insight",
+    "app", "qvapp", "qlikview", "collection", "insight", "genericlink",
+    "sharingservicetask", "note", "dataasset", "dataset", "dataproduct",
+    "automation", "automl-experiment", "automl-deployment", "knowledgebase",
+    "assistant", "dataflow", "script", "glossary", "dcaas",
 })
 
 
@@ -27,17 +30,29 @@ class SearchInput(BaseModel):
 
     query: str = Field(
         description=(
-            "Search text to find apps, data products, or other resources. "
-            "Matches against name, description, and tags. "
+            "Search text to find apps, datasets, data products, or other resources. "
+            "Case-insensitive match against name and description. "
             "Example: 'revenue dashboard', 'HR attrition', 'sales forecast'"
-        )
+        ),
+        min_length=1,
+        max_length=512,
     )
     resource_type: Optional[str] = Field(
         default=None,
         description=(
-            "Filter results by resource type: 'app', 'dataset', "
-            "'automation', 'note', or omit for all types"
-        )
+            "Filter results by resource type: 'app', 'dataset', 'dataproduct', "
+            "'automation', 'note', 'glossary', 'knowledgebase', or omit for all types"
+        ),
+    )
+    space: Optional[str] = Field(
+        default=None,
+        description="Filter by space ID to search within a specific space",
+    )
+    limit: Optional[int] = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description="Maximum number of results to return (default: 20, max: 100)",
     )
 
     @field_validator("resource_type")
@@ -49,28 +64,18 @@ class SearchInput(BaseModel):
                 f"Allowed: {', '.join(sorted(_VALID_RESOURCE_TYPES))}"
             )
         return v
-    space: Optional[str] = Field(
-        default=None,
-        description="Filter by space ID to search within a specific space"
-    )
-    limit: Optional[int] = Field(
-        default=20,
-        ge=1,
-        description="Maximum number of results to return (default: 20, max: 40)"
-    )
 
 
 TOOL_DESCRIPTION = (
-    "Search the Qlik Cloud catalog to find apps, datasets, automations, and other resources. "
-    "Use this for metric discovery — finding which apps contain relevant data before "
-    "requesting specific data with qlik_get_hypercube_data. "
-    "Returns a list of matching resources with their IDs, names, types, and descriptions."
+    "Search the Qlik Cloud catalog to find apps, datasets, data products, automations, "
+    "and other resources. Use this for metric discovery: finding which apps contain "
+    "relevant data before requesting specific data with qlik_get_hypercube_data. "
+    "Returns matching resources with their IDs, names, types, descriptions, and links. "
+    "For apps, use resource_id as the app_id in other tools."
 )
 
 
-async def handle_search(
-    client: QlikCloudClient, params: dict
-) -> dict:
+async def handle_search(client: QlikCloudClient, params: dict) -> dict:
     """Execute the qlik_search tool."""
     input_data = SearchInput(**params)
 

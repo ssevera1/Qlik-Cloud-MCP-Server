@@ -4,31 +4,31 @@ Runtime containers that make up the MCP Server.
 
 ```mermaid
 C4Container
-    title Container Diagram — Qlik Cloud MCP Server
+    title Container Diagram: Qlik Cloud MCP Server
 
     Person(aiAgent, "AI Agent", "Calls MCP tools")
 
     System_Boundary(server, "Qlik Cloud MCP Server") {
-        Container(mcpRuntime, "MCP Runtime", "Python / mcp SDK", "Handles MCP protocol:<br/>tool listing, invocation,<br/>input validation, responses")
+        Container(mcpRuntime, "MCP Runtime", "Python / mcp SDK v2 (MCPServer)", "Handles MCP protocol:<br/>tool listing, invocation,<br/>input validation, structured results")
 
-        Container(toolRegistry, "Tool Registry", "Python", "Registers and dispatches<br/>the 4 Qlik tools")
+        Container(toolRegistry, "Tool Registration", "Python (server.py)", "Registers the 5 Qlik tools<br/>with flat typed signatures;<br/>sanitizes errors")
 
-        Container(restClient, "REST API Client", "Python / httpx", "Qlik Cloud REST API:<br/>app catalog, search,<br/>metadata queries")
+        Container(restClient, "REST API Client", "Python / httpx", "Qlik Cloud REST API:<br/>catalog search,<br/>app metadata, spaces")
 
-        Container(engineClient, "Engine API Client", "Python / websockets", "WebSocket JSON-RPC:<br/>hypercubes, sheets,<br/>selections, layouts")
+        Container(engineClient, "Engine API Client", "Python / websockets", "WebSocket JSON-RPC:<br/>fields, hypercubes, sheets,<br/>selections, save")
 
         Container(authModule, "Auth Module", "Python", "API key injection +<br/>OAuth2 M2M token<br/>acquisition & refresh")
 
-        Container(configMgr, "Config Manager", "Python / pyyaml", "Loads config.yaml,<br/>resolves env vars,<br/>validates settings")
+        Container(configMgr, "Config Manager", "Python / pyyaml", "Loads config.yaml or env,<br/>resolves env vars,<br/>validates settings")
     }
 
-    System_Ext(qlikRest, "Qlik Cloud REST API", "/api/v1/items, /api/v1/apps")
+    System_Ext(qlikRest, "Qlik Cloud REST API", "/api/v1/items, /api/v1/apps, /oauth/token")
     System_Ext(qlikEngine, "Qlik Associative Engine", "wss://tenant/app/{id}")
 
-    Rel(aiAgent, mcpRuntime, "MCP Protocol", "stdio / SSE")
+    Rel(aiAgent, mcpRuntime, "MCP Protocol", "stdio / Streamable HTTP")
     Rel(mcpRuntime, toolRegistry, "Dispatches tool calls")
-    Rel(toolRegistry, restClient, "Search, app metadata")
-    Rel(toolRegistry, engineClient, "Hypercubes, sheets, layouts")
+    Rel(toolRegistry, restClient, "Search")
+    Rel(toolRegistry, engineClient, "Fields, hypercubes, sheets")
     Rel(restClient, authModule, "Gets auth headers")
     Rel(engineClient, authModule, "Gets auth headers")
     Rel(authModule, configMgr, "Reads credentials")
@@ -39,48 +39,52 @@ C4Container
 ## Container Responsibilities
 
 ### MCP Runtime
-- Implements the Model Context Protocol server using the official `mcp` SDK
+- Implements the Model Context Protocol server using the official `mcp` SDK v2 `MCPServer`
 - Handles tool listing (`tools/list`), tool invocation (`tools/call`), and error responses
-- Supports stdio transport (for local agents like Claude Code) and SSE (for remote agents)
-- Validates tool inputs against JSON Schema before dispatching
+- Supports stdio transport (for local agents like Claude Code) and Streamable HTTP (for remote agents); legacy SSE is still available with a deprecation warning
+- Validates tool inputs against the generated JSON Schema before dispatching
+- Emits every tool result as both text and structured content
 
-### Tool Registry
-- Registers the four Qlik tools with their schemas and handlers
-- Routes tool calls to the appropriate handler function
+### Tool Registration
+- Registers the five Qlik tools (`qlik_search`, `qlik_get_fields`, `qlik_get_sheet_details`, `qlik_get_hypercube_data`, `qlik_create_sheet`) with descriptions and constraints taken from the Pydantic input models
+- Marks read-only tools with the MCP `readOnlyHint` annotation
 - Manages tool enable/disable via configuration
+- Converts every failure into a JSON error payload; unexpected exceptions are logged in full but reported to the agent generically
 
 ### REST API Client
-- Async HTTP client (httpx) for Qlik Cloud REST API
-- App catalog queries (`/api/v1/items`)
-- App metadata (`/api/v1/apps/{id}`)
-- Space listing and search
-- Handles pagination, rate limiting, and retries
+- Async HTTP client (httpx) for the Qlik Cloud REST API
+- Catalog search (`GET /api/v1/items`, page size capped at 100)
+- App metadata (`/api/v1/apps/{id}`) and space listing
+- Retries timeouts, honors `Retry-After` on 429 (capped at 60 seconds), and maps transport failures to a safe error
 
 ### Engine API Client
 - WebSocket client for the Qlik Associative Engine JSON-RPC protocol
-- Opens ephemeral connections per tool call (stateless)
-- Implements the "handle" system: Global → Doc → GenericObject
-- Methods: `GetLayout`, `CreateSessionObject` (hypercubes), `CreateSheet`
-- Properly closes connections after each operation
+- Opens one connection per tool call (stateless) and closes it afterwards
+- Implements the "handle" system: Global (-1) to Doc via `OpenDoc`, then GenericObject handles
+- Methods used: `GetObjects`, `GetObject`, `GetLayout`, `CreateSessionObject`, `GetHyperCubeData`, `GetField`, `SelectValues`, `CreateObject`, `CreateChild`, `GetProperties`, `SetProperties`, `DoSave`
+- Skips engine notifications while waiting for a response and enforces per-message and per-request deadlines
 
 ### Auth Module
-- **API Key mode**: Injects `Authorization: Bearer {key}` header
-- **OAuth2 M2M mode**: Acquires access token via client credentials grant, caches and refreshes automatically
+- **API Key mode**: injects `Authorization: Bearer {key}`
+- **OAuth2 M2M mode**: posts a JSON client-credentials request to `/oauth/token`, caches the token, and refreshes before expiry
+- Refuses token URLs that are not on the configured tenant host
 - Provides auth headers for both REST (HTTP) and Engine (WebSocket) clients
 
 ### Config Manager
-- Loads `config.yaml` with `${ENV_VAR}` interpolation
-- Validates required fields (tenant URL, credentials)
-- Provides typed access to tool-specific settings (row limits, enabled tools)
+- Loads `config.yaml` with `${ENV_VAR}` interpolation, or builds config from environment variables alone
+- Validates the tenant URL is a bare https origin, credentials are present, the transport is known, and the port is an integer
+- Accepts legacy `sse_host` / `sse_port` keys and maps them to `http_host` / `http_port`
 
 ## Transport Modes
 
 ```
-┌─────────────────────────────┐      ┌──────────────────────────────┐
-│  STDIO Transport (Default)  │      │  SSE Transport (Remote)      │
-│                             │      │                              │
-│  Claude Code ←→ stdin/out   │      │  Agent ←→ HTTP SSE endpoint  │
-│  Local process, no network  │      │  Network, port 8080          │
-│  Ideal for dev & testing    │      │  Ideal for production        │
-└─────────────────────────────┘      └──────────────────────────────┘
++-----------------------------+      +------------------------------+
+|  STDIO Transport (Default)  |      |  Streamable HTTP (Remote)    |
+|                             |      |                              |
+|  Claude Code <-> stdin/out  |      |  Agent <-> HTTP /mcp         |
+|  Local process, no network  |      |  Network, port 8080          |
+|  Ideal for dev & testing    |      |  Behind an auth proxy        |
++-----------------------------+      +------------------------------+
 ```
+
+When the HTTP transport is bound to a loopback address the server enables the SDK's DNS-rebinding protection (only localhost Host headers and origins are accepted). On any other bind address host validation is left to the reverse proxy in front of the server.

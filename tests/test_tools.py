@@ -141,3 +141,16 @@ class TestSearchInput:
         for rt in ("app", "dataset", "automation", "note"):
             inp = SearchInput(query="test", resource_type=rt)
             assert inp.resource_type == rt
+
+
+class TestSearchResourceTypes:
+    def test_data_product_and_qvapp_accepted(self):
+        for rt in ("dataproduct", "qvapp", "collection"):
+            assert SearchInput(query="x", resource_type=rt).resource_type == rt
+
+
+class TestCreateSheetVisTypes:
+    def test_non_hypercube_types_rejected(self):
+        from qlik_mcp_server.tools.create_sheet import _ALLOWED_VIS_TYPES
+        assert "filterpane" not in _ALLOWED_VIS_TYPES
+        assert "barchart" in _ALLOWED_VIS_TYPES

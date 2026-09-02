@@ -34,3 +34,7 @@ Thumbs.db
 
 # Claude
 .claude/
+
+# Test caches
+.pytest_cache/
+.ruff_cache/

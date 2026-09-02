@@ -1,11 +1,12 @@
 """Qlik Cloud REST API client.
 
-Handles app catalog queries, search, metadata retrieval,
-and space listing via the Qlik Cloud REST API.
+Handles catalog search, app metadata, and space listing via the
+Qlik Cloud REST API. Reference: https://qlik.dev/apis/rest/items/
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -21,6 +22,11 @@ _UUID_RE = re.compile(
     re.IGNORECASE,
 )
 
+# The Items API caps page size at 100.
+_ITEMS_MAX_LIMIT = 100
+# Never honor a Retry-After longer than this (seconds).
+_MAX_RETRY_AFTER = 60
+
 logger = logging.getLogger(__name__)
 
 
@@ -35,10 +41,16 @@ class QlikCloudError(Exception):
 class QlikCloudClient:
     """Async client for the Qlik Cloud REST API."""
 
-    def __init__(self, config: Config, auth: AuthManager) -> None:
+    def __init__(
+        self,
+        config: Config,
+        auth: AuthManager,
+        transport: Optional[httpx.AsyncBaseTransport] = None,
+    ) -> None:
         self.config = config
         self.auth = auth
         self.base_url = config.qlik.tenant_url.rstrip("/")
+        self._transport = transport
         self._client: Optional[httpx.AsyncClient] = None
 
     async def _ensure_client(self) -> httpx.AsyncClient:
@@ -47,6 +59,7 @@ class QlikCloudClient:
             self._client = httpx.AsyncClient(
                 timeout=self.config.qlik.timeout_seconds,
                 follow_redirects=True,
+                transport=self._transport,
             )
         return self._client
 
@@ -72,12 +85,17 @@ class QlikCloudClient:
                 )
 
                 if response.status_code == 429:
+                    if attempt >= self.config.qlik.max_retries - 1:
+                        raise QlikCloudError(
+                            "Qlik Cloud rate limit exceeded; try again later",
+                            status_code=429,
+                        )
                     try:
                         retry_after = int(response.headers.get("Retry-After", "5"))
                     except ValueError:
                         retry_after = 5
+                    retry_after = min(max(retry_after, 1), _MAX_RETRY_AFTER)
                     logger.warning("Rate limited. Retrying in %ds...", retry_after)
-                    import asyncio
                     await asyncio.sleep(retry_after)
                     continue
 
@@ -98,13 +116,33 @@ class QlikCloudClient:
                         return {"raw_content": response.text}
                 return None
 
-            except httpx.TimeoutException:
+            except httpx.TimeoutException as e:
                 if attempt < self.config.qlik.max_retries - 1:
-                    logger.warning("Request timeout, retrying (%d/%d)...", attempt + 1, self.config.qlik.max_retries)
+                    logger.warning(
+                        "Request timeout, retrying (%d/%d)...",
+                        attempt + 1, self.config.qlik.max_retries,
+                    )
                     continue
-                raise QlikCloudError("Request timed out after all retries")
+                raise QlikCloudError("Request timed out after all retries") from e
+            except httpx.HTTPError as e:
+                # Transport-level failure (DNS, TLS, connection refused). Keep the
+                # message generic for the agent; details go to the log.
+                logger.error("Qlik Cloud request to %s failed: %s", path, e)
+                raise QlikCloudError(
+                    f"Could not reach Qlik Cloud tenant {self.config.tenant_host}: "
+                    "connection failed"
+                ) from e
 
         raise QlikCloudError("Max retries exceeded")
+
+    def _open_url(self, item: dict) -> str:
+        """Best-effort link to open an item in the Qlik Cloud hub."""
+        href = ((item.get("links") or {}).get("open") or {}).get("href")
+        if href:
+            return href
+        if item.get("resourceType") == "app" and item.get("resourceId"):
+            return f"{self.base_url}/sense/app/{item['resourceId']}"
+        return ""
 
     async def search_items(
         self,
@@ -116,17 +154,14 @@ class QlikCloudClient:
         """Search the Qlik Cloud catalog for apps, data products, and other items.
 
         Args:
-            query: Search text (matches name, description, tags).
-            resource_type: Filter by type ("app", "dataset", "automation", etc.).
+            query: Search text (case-insensitive match on name or description).
+            resource_type: Filter by type ("app", "dataset", "dataproduct", ...).
             space_id: Filter by space ID.
-            limit: Maximum results to return.
-
-        Returns:
-            List of matching items with metadata.
+            limit: Maximum results to return (capped at 100 by the API).
         """
         params: dict[str, Any] = {
             "query": query,
-            "limit": min(limit, 40),
+            "limit": max(1, min(limit, _ITEMS_MAX_LIMIT)),
         }
         if resource_type:
             params["resourceType"] = resource_type
@@ -136,7 +171,6 @@ class QlikCloudClient:
         result = await self._request("GET", "/api/v1/items", params=params)
         items = result.get("data", []) if result else []
 
-        # Flatten to essential fields
         return [
             {
                 "id": item.get("id", ""),
@@ -144,18 +178,19 @@ class QlikCloudClient:
                 "name": item.get("name", ""),
                 "description": item.get("description", ""),
                 "resource_type": item.get("resourceType", ""),
+                "resource_sub_type": item.get("resourceSubType", ""),
                 "space_id": item.get("spaceId", ""),
                 "owner_id": item.get("ownerId", ""),
                 "updated_at": item.get("updatedAt", ""),
                 "created_at": item.get("createdAt", ""),
-                "collection_ids": item.get("collectionIds", []),
+                "url": self._open_url(item),
             }
             for item in items
         ]
 
     async def get_app(self, app_id: str) -> dict:
         """Get metadata for a specific app."""
-        if not _UUID_RE.match(app_id):
+        if not _UUID_RE.fullmatch(app_id):
             raise QlikCloudError("Invalid app_id: expected UUID format")
         result = await self._request("GET", f"/api/v1/apps/{app_id}")
         if not result:
@@ -166,14 +201,14 @@ class QlikCloudClient:
         self, space_id: Optional[str] = None, limit: int = 50
     ) -> list[dict]:
         """List apps, optionally filtered by space."""
-        params: dict[str, Any] = {"limit": min(limit, 100)}
+        params: dict[str, Any] = {
+            "limit": max(1, min(limit, _ITEMS_MAX_LIMIT)),
+            "resourceType": "app",
+        }
         if space_id:
             params["spaceId"] = space_id
 
-        result = await self._request("GET", "/api/v1/items", params={
-            **params,
-            "resourceType": "app",
-        })
+        result = await self._request("GET", "/api/v1/items", params=params)
         return result.get("data", []) if result else []
 
     async def get_spaces(self) -> list[dict]:
@@ -190,13 +225,3 @@ class QlikCloudClient:
             }
             for s in spaces
         ]
-
-    async def get_app_objects(self, app_id: str) -> list[dict]:
-        """Get objects (sheets, bookmarks) for an app via REST."""
-        if not _UUID_RE.match(app_id):
-            raise QlikCloudError("Invalid app_id: expected UUID format")
-        result = await self._request(
-            "GET", f"/api/v1/apps/{app_id}/objects",
-            params={"limit": 100},
-        )
-        return result.get("data", []) if result else []

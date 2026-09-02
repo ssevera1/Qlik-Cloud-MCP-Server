@@ -14,13 +14,13 @@ Two approaches for the MCP server:
 
 ## Decision
 
-**Chosen: Stateless tool calls — one WebSocket connection per tool invocation.**
+**Chosen: Stateless tool calls, one WebSocket connection per tool invocation.**
 
 ## Rationale
 
 1. **MCP protocol alignment**: MCP tools are designed to be stateless function calls. Each invocation should produce the same result regardless of previous calls. Persistent sessions would leak state (selections from a previous call affecting the next).
 
-2. **Simplicity**: No session pool management, no connection health monitoring, no stale session handling. The server is a pure function: input → Qlik call → output.
+2. **Simplicity**: No session pool management, no connection health monitoring, no stale session handling. The server is a pure function: input, Qlik call, output.
 
 3. **Concurrency safety**: Multiple AI agents (or the same agent making parallel calls) won't interfere with each other's sessions. Each call gets its own isolated engine session.
 
@@ -34,7 +34,8 @@ Two approaches for the MCP server:
 
 ## Consequences
 
-- `EngineSession` is an async context manager — always opens and closes cleanly
+- `EngineClient.open_app()` is an async context manager that always opens and closes the session cleanly
 - Tool inputs must be self-contained (filters + query in one call)
 - No session pool or connection cache in the server
-- The `qlik_get_hypercube_data` tool accepts optional `filters` parameter for selections within a single call
+- The `qlik_get_hypercube_data` tool accepts an optional `filters` parameter for selections within a single call, and reports any filter the engine could not match in `filters_not_matched`
+- `qlik_create_sheet` saves the app (`DoSave`) inside the same call, since nothing survives the session otherwise

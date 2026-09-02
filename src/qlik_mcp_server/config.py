@@ -8,12 +8,15 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import yaml
 
 logger = logging.getLogger(__name__)
 
 _ENV_VAR_PATTERN = re.compile(r"\$\{([^}]+)\}")
+
+VALID_TRANSPORTS = ("stdio", "streamable-http", "sse")
 
 
 def _resolve_env_vars(value: str) -> str:
@@ -50,6 +53,24 @@ def _resolve_dict(data: dict) -> dict:
     return resolved
 
 
+def _tenant_url_errors(url: str) -> list[str]:
+    """Reject anything other than a bare https://host[:port] tenant URL.
+
+    Every REST and WebSocket URL is built from this value, so a path,
+    query, fragment, or embedded credentials would end up in requests.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        return ["qlik.tenant_url must start with https://"]
+    if not parsed.hostname:
+        return ["qlik.tenant_url must include a hostname"]
+    if parsed.username or parsed.password:
+        return ["qlik.tenant_url must not contain credentials"]
+    if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+        return ["qlik.tenant_url must be the bare tenant origin, e.g. https://tenant.us.qlikcloud.com"]
+    return []
+
+
 @dataclass
 class OAuthConfig:
     client_id: str = ""
@@ -70,15 +91,21 @@ class QlikConfig:
 @dataclass
 class ServerConfig:
     transport: str = "stdio"
-    sse_host: str = "127.0.0.1"
-    sse_port: int = 8080
+    http_host: str = "127.0.0.1"
+    http_port: int = 8080
+    http_path: str = "/mcp"
     log_level: str = "INFO"
+
+
+# Config keys from the SSE-only era, mapped onto the transport-neutral names.
+_LEGACY_SERVER_KEYS = {"sse_host": "http_host", "sse_port": "http_port"}
 
 
 @dataclass
 class ToolSettings:
     get_sheet_details: bool = True
     get_hypercube_data: bool = True
+    get_fields: bool = True
     create_sheet: bool = True
     search: bool = True
     max_hypercube_rows: int = 10000
@@ -100,7 +127,7 @@ class Config:
         if not path.exists():
             raise FileNotFoundError(f"Configuration file not found: {path}")
 
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             raw = yaml.safe_load(f) or {}
 
         data = _resolve_dict(raw)
@@ -110,15 +137,33 @@ class Config:
     def from_env(cls) -> Config:
         """Build config from environment variables only."""
         config = cls()
-        config.qlik.tenant_url = os.environ.get("QLIK_TENANT_URL", "")
-        config.qlik.api_key = os.environ.get("QLIK_API_KEY", "")
+        env = os.environ
+        config.qlik.tenant_url = env.get("QLIK_TENANT_URL", "")
+        config.qlik.api_key = env.get("QLIK_API_KEY", "")
+        config.qlik.default_app_id = env.get("QLIK_DEFAULT_APP_ID", "")
+
+        client_id = env.get("QLIK_OAUTH_CLIENT_ID", "")
+        if client_id:
+            config.qlik.oauth = OAuthConfig(
+                client_id=client_id,
+                client_secret=env.get("QLIK_OAUTH_CLIENT_SECRET", ""),
+                token_url=env.get("QLIK_OAUTH_TOKEN_URL", ""),
+            )
+
+        if env.get("QLIK_MCP_TRANSPORT"):
+            config.server.transport = env["QLIK_MCP_TRANSPORT"]
+        if env.get("QLIK_MCP_HTTP_PORT"):
+            try:
+                config.server.http_port = int(env["QLIK_MCP_HTTP_PORT"])
+            except ValueError:
+                logger.warning("QLIK_MCP_HTTP_PORT is not an integer, ignoring")
         return config
 
     @classmethod
     def _from_dict(cls, data: dict[str, Any]) -> Config:
         config = cls()
 
-        if "qlik" in data:
+        if "qlik" in data and data["qlik"]:
             qlik_data = data["qlik"]
             oauth_data = qlik_data.get("oauth", None)
             config.qlik = QlikConfig(**{
@@ -131,13 +176,16 @@ class Config:
                     if k in OAuthConfig.__dataclass_fields__
                 })
 
-        if "server" in data:
+        if "server" in data and data["server"]:
+            server_data = {
+                _LEGACY_SERVER_KEYS.get(k, k): v for k, v in data["server"].items()
+            }
             config.server = ServerConfig(**{
-                k: v for k, v in data["server"].items()
+                k: v for k, v in server_data.items()
                 if k in ServerConfig.__dataclass_fields__
             })
 
-        if "tools" in data:
+        if "tools" in data and data["tools"]:
             config.tools = ToolSettings(**{
                 k: v for k, v in data["tools"].items()
                 if k in ToolSettings.__dataclass_fields__
@@ -151,8 +199,8 @@ class Config:
 
         if not self.qlik.tenant_url:
             errors.append("qlik.tenant_url is required")
-        elif not self.qlik.tenant_url.startswith("https://"):
-            errors.append("qlik.tenant_url must start with https://")
+        else:
+            errors.extend(_tenant_url_errors(self.qlik.tenant_url))
 
         has_api_key = bool(self.qlik.api_key) and not self.qlik.api_key.startswith("${")
         has_oauth = (
@@ -166,8 +214,15 @@ class Config:
                 "Authentication required: set qlik.api_key or qlik.oauth credentials"
             )
 
-        if self.server.transport not in ("stdio", "sse"):
-            errors.append(f"server.transport must be 'stdio' or 'sse', got '{self.server.transport}'")
+        if self.server.transport not in VALID_TRANSPORTS:
+            errors.append(
+                "server.transport must be one of "
+                f"{', '.join(VALID_TRANSPORTS)}, got '{self.server.transport}'"
+            )
+
+        port = self.server.http_port
+        if isinstance(port, bool) or not isinstance(port, int) or not (1 <= port <= 65535):
+            errors.append("server.http_port must be an integer between 1 and 65535")
 
         if self.tools.max_hypercube_rows < 1:
             errors.append("tools.max_hypercube_rows must be >= 1")
@@ -183,5 +238,5 @@ class Config:
 
     @property
     def tenant_host(self) -> str:
-        """Extract hostname from tenant URL."""
-        return self.qlik.tenant_url.rstrip("/").replace("https://", "")
+        """Hostname of the tenant URL (no scheme, path, or credentials)."""
+        return urlparse(self.qlik.tenant_url).hostname or ""

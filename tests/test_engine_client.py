@@ -1,6 +1,5 @@
 """Tests for the Engine API client."""
 
-import json
 
 import pytest
 

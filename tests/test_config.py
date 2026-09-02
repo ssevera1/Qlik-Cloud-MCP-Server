@@ -93,9 +93,9 @@ class TestConfigValidation:
         assert any("https://" in e for e in errors)
 
 
-    def test_sse_default_host_is_localhost(self):
+    def test_http_default_host_is_localhost(self):
         config = Config()
-        assert config.server.sse_host == "127.0.0.1"
+        assert config.server.http_host == "127.0.0.1"
 
 
 class TestConfigProperties:
@@ -116,3 +116,31 @@ class TestConfigProperties:
         config = Config()
         config.qlik.tenant_url = "https://my-tenant.us.qlikcloud.com"
         assert config.tenant_host == "my-tenant.us.qlikcloud.com"
+
+
+class TestTransportConfig:
+    def test_streamable_http_is_valid_transport(self):
+        config = Config()
+        config.qlik.tenant_url = "https://test.qlikcloud.com"
+        config.qlik.api_key = "key"
+        config.server.transport = "streamable-http"
+        assert config.validate() == []
+
+    def test_legacy_sse_keys_still_load(self, tmp_path):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            "qlik:\n  tenant_url: https://t.qlikcloud.com\n  api_key: k\n"
+            "server:\n  transport: sse\n  sse_host: 0.0.0.0\n  sse_port: 9000\n"  # noqa: S104
+        )
+        config = Config.load(config_file)
+        assert config.server.http_host == "0.0.0.0"  # noqa: S104
+        assert config.server.http_port == 9000
+
+    def test_from_env_reads_oauth(self, monkeypatch):
+        monkeypatch.setenv("QLIK_TENANT_URL", "https://env.qlikcloud.com")
+        monkeypatch.delenv("QLIK_API_KEY", raising=False)
+        monkeypatch.setenv("QLIK_OAUTH_CLIENT_ID", "cid")
+        monkeypatch.setenv("QLIK_OAUTH_CLIENT_SECRET", "sec")
+        config = Config.from_env()
+        assert config.auth_mode == "oauth"
+        assert config.validate() == []

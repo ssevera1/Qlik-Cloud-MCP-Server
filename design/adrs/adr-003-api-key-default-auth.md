@@ -17,7 +17,7 @@ Qlik Cloud supports multiple authentication methods for API access:
 
 ## Rationale
 
-1. **Simplicity of onboarding**: API keys require one step — generate in Qlik Cloud hub, paste into config. OAuth2 M2M requires creating an OAuth client, configuring scopes, and managing client ID + secret pairs.
+1. **Simplicity of onboarding**: API keys require one step: generate in Qlik Cloud hub, paste into config. OAuth2 M2M requires creating an OAuth client, configuring scopes, and managing client ID + secret pairs.
 
 2. **Sufficient for most deployments**: API keys provide full access scoped to the user who generated them. For MCP servers running as a service account, this is adequate.
 
@@ -30,7 +30,9 @@ Qlik Cloud supports multiple authentication methods for API access:
 
 ## Consequences
 
-- Config supports both `api_key` and `oauth` blocks (mutually exclusive)
+- Config supports both `api_key` and `oauth` blocks; when both are present, OAuth wins
 - `AuthManager` auto-detects which mode to use based on config
-- OAuth2 token caching and refresh is handled transparently
+- OAuth2 tokens are requested with a JSON client-credentials body at `<tenant>/oauth/token` (the endpoint Qlik documents), cached, and refreshed one minute before expiry
+- The OAuth token URL must be HTTPS and on the configured tenant host, so misconfiguration cannot send the client secret elsewhere
+- The same bearer token is used for REST calls and the Engine WebSocket `Authorization` header
 - Documentation includes setup instructions for both methods

@@ -1,9 +1,7 @@
-"""qlik_create_sheet — Dynamically build temporary analysis views.
+"""qlik_create_sheet: build analysis views on demand.
 
-An advanced capability where an agent can dynamically construct a
-temporary analysis view. If a user asks a novel question that no
-existing dashboard answers, the agent can build a new sheet with
-appropriate charts and filters.
+If a user asks a novel question that no existing dashboard answers, the
+agent can build a new sheet with charts, which is then saved into the app.
 """
 
 from __future__ import annotations
@@ -18,11 +16,14 @@ from ..engine_client import EngineClient, EngineError
 logger = logging.getLogger(__name__)
 
 
+# Visualization types whose properties are driven by a single qHyperCubeDef.
+# Types with other data structures (filterpane, text-image, map) are excluded
+# because the simple dimensions/measures definition would not render them.
 _ALLOWED_VIS_TYPES = frozenset({
     "barchart", "linechart", "piechart", "table", "kpi",
     "scatterplot", "treemap", "combochart", "gauge", "waterfallchart",
-    "boxplot", "distributionplot", "histogram", "map", "pivot-table",
-    "text-image", "filterpane",
+    "boxplot", "distributionplot", "histogram", "pivot-table", "mekkochart",
+    "bulletchart",
 })
 
 
@@ -31,15 +32,13 @@ class VisualizationObject(BaseModel):
 
     type: str = Field(
         description=(
-            "Visualization type: 'barchart', 'linechart', 'piechart', "
-            "'table', 'kpi', 'scatterplot', 'treemap', 'combochart'"
+            "Visualization type: 'barchart', 'linechart', 'piechart', 'table', "
+            "'kpi', 'scatterplot', 'treemap', 'combochart', 'gauge', "
+            "'waterfallchart', 'boxplot', 'distributionplot', 'histogram', "
+            "'pivot-table', 'mekkochart', 'bulletchart'"
         )
     )
-    title: str = Field(
-        default="",
-        description="Title for the visualization",
-        max_length=512,
-    )
+    title: str = Field(default="", description="Title for the visualization", max_length=512)
     dimensions: list[str] = Field(
         default_factory=list,
         description="Field names for dimensions (e.g., ['Region', 'Product'])",
@@ -55,33 +54,26 @@ class VisualizationObject(BaseModel):
 class CreateSheetInput(BaseModel):
     """Input schema for qlik_create_sheet."""
 
-    app_id: str = Field(
-        description="The Qlik Cloud app ID to create the sheet in"
-    )
-    title: str = Field(
-        description="Title for the new sheet"
-    )
-    description: Optional[str] = Field(
-        default="",
-        description="Optional description for the sheet"
-    )
+    app_id: str = Field(description="The Qlik Cloud app ID to create the sheet in")
+    title: str = Field(description="Title for the new sheet", min_length=1, max_length=256)
+    description: Optional[str] = Field(default="", description="Optional description for the sheet")
     objects: list[VisualizationObject] = Field(
         default_factory=list,
         description=(
-            "List of visualization objects to add to the sheet. "
+            "List of visualization objects to add to the sheet (up to 24). "
             "Each object defines a chart type, dimensions, and measures."
         ),
-        max_length=50,
+        max_length=24,
     )
 
 
 TOOL_DESCRIPTION = (
-    "Create a new analysis sheet in a Qlik Cloud app with visualizations. "
+    "Create a new analysis sheet in a Qlik Cloud app with visualizations, and save the app. "
     "Use this when no existing dashboard answers the user's question. "
     "You can add multiple visualization objects (bar charts, line charts, KPIs, tables) "
-    "with specified dimensions and measures. The sheet title will be prefixed with "
-    "'[Agent]' to distinguish it from manually created sheets. "
-    "Returns the sheet ID and a link to view it."
+    "with specified dimensions and measures; they are laid out automatically on the sheet. "
+    "The sheet title is prefixed (default '[Agent]') to distinguish it from manually "
+    "created sheets. Returns the sheet ID and a link to view it."
 )
 
 
@@ -100,7 +92,6 @@ async def handle_create_sheet(
 
     input_data = CreateSheetInput(**params)
 
-    # Validate visualization types
     for obj in input_data.objects:
         if obj.type not in _ALLOWED_VIS_TYPES:
             return {
@@ -109,12 +100,10 @@ async def handle_create_sheet(
                 "app_id": input_data.app_id,
             }
 
-    # Prefix the title
     prefixed_title = f"{sheet_prefix}{input_data.title}"
 
     try:
         async with engine.open_app(input_data.app_id) as session:
-            # Build object definitions
             obj_defs = [
                 {
                     "type": obj.type,
@@ -134,7 +123,7 @@ async def handle_create_sheet(
             tenant_host = engine.config.tenant_host
             sheet_url = (
                 f"https://{tenant_host}/sense/app/{input_data.app_id}"
-                f"/sheet/{result['sheet_id']}"
+                f"/sheet/{result['sheet_id']}/state/analysis"
             )
 
             return {
@@ -142,10 +131,14 @@ async def handle_create_sheet(
                 "sheet_id": result["sheet_id"],
                 "title": prefixed_title,
                 "object_count": result["object_count"],
+                "objects": result.get("objects", []),
+                "failed_objects": result.get("failed_objects", []),
+                "saved": result.get("saved", False),
                 "url": sheet_url,
                 "note": (
-                    "This is a session sheet — it will persist in the app "
-                    "until manually removed or the app is reloaded."
+                    "The sheet was saved into the app and will remain until "
+                    "someone deletes it. It is private to the account that created it "
+                    "until published."
                 ),
             }
 
@@ -154,5 +147,5 @@ async def handle_create_sheet(
         return {
             "error": str(e),
             "app_id": input_data.app_id,
-            "hint": "Verify the app_id and ensure the service account has edit access.",
+            "hint": "Verify the app_id and ensure the service account has edit access to the app.",
         }

@@ -95,11 +95,13 @@ async def handle_get_hypercube_data(
 
     try:
         async with engine.open_app(input_data.app_id) as session:
-            # Apply filters if provided
-            if input_data.filters:
-                for f in input_data.filters:
-                    await session.apply_selections(f.field, f.values)
-                    logger.debug("Applied filter: %s = %s", f.field, f.values)
+            # Apply filters if provided; remember any the engine could not match.
+            unmatched: list[dict] = []
+            for f in input_data.filters or []:
+                matched = await session.apply_selections(f.field, f.values)
+                logger.debug("Applied filter: %s = %s (matched=%s)", f.field, f.values, matched)
+                if not matched:
+                    unmatched.append({"field": f.field, "values": f.values})
 
             # Create and fetch hypercube
             result = await session.create_hypercube(
@@ -108,7 +110,7 @@ async def handle_get_hypercube_data(
                 max_rows=effective_max,
             )
 
-            return {
+            payload: dict = {
                 "app_id": input_data.app_id,
                 "headers": result.headers,
                 "data": result.rows,
@@ -118,9 +120,18 @@ async def handle_get_hypercube_data(
                 "filters_applied": [
                     {"field": f.field, "values": f.values}
                     for f in (input_data.filters or [])
+                    if {"field": f.field, "values": f.values} not in unmatched
                 ],
+                "filters_not_matched": unmatched,
                 "table": result.to_table(),
             }
+            if unmatched:
+                payload["warning"] = (
+                    "Some filter values did not match any data and were not applied: "
+                    + ", ".join(f"{u['field']}={u['values']}" for u in unmatched)
+                    + ". Use qlik_get_fields to check field names."
+                )
+            return payload
 
     except EngineError as e:
         logger.error("Engine error in get_hypercube_data: %s", e)

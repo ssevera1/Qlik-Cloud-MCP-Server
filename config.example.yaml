@@ -6,11 +6,12 @@ qlik:
   # Authentication: use EITHER api_key OR oauth (not both)
   api_key: ${QLIK_API_KEY}
 
-  # OAuth2 Machine-to-Machine (alternative to api_key)
+  # OAuth2 Machine-to-Machine (alternative to api_key).
+  # Create the client in the Management Console with the client_credentials grant.
   # oauth:
   #   client_id: ${QLIK_OAUTH_CLIENT_ID}
   #   client_secret: ${QLIK_OAUTH_CLIENT_SECRET}
-  #   token_url: https://your-tenant.us.qlikcloud.com/oauth/token
+  #   token_url: https://your-tenant.us.qlikcloud.com/oauth/token   # optional, derived from tenant_url
 
   # Default app ID for tools that don't specify one
   # default_app_id: ""
@@ -20,23 +21,29 @@ qlik:
   max_retries: 3
 
 server:
-  # Transport: "stdio" (default, for Claude Code / local agents)
-  #            "sse" (HTTP server for remote agents)
+  # Transport:
+  #   "stdio"           (default) local agents such as Claude Code / Claude Desktop
+  #   "streamable-http" HTTP server for remote agents (current MCP spec transport)
+  #   "sse"             legacy HTTP transport, deprecated in the MCP spec
   transport: stdio
 
-  # SSE settings (only used when transport=sse)
-  sse_host: 0.0.0.0
-  sse_port: 8080
+  # HTTP settings (only used when transport is streamable-http or sse).
+  # Bind to 127.0.0.1 unless you put the server behind an authenticating proxy:
+  # the MCP endpoint itself is unauthenticated and holds your Qlik credentials.
+  http_host: 127.0.0.1
+  http_port: 8080
+  http_path: /mcp
 
   # Logging
   log_level: INFO
 
 tools:
   # Enable/disable specific tools
+  search: true
+  get_fields: true
   get_sheet_details: true
   get_hypercube_data: true
   create_sheet: true
-  search: true
 
   # Hypercube limits
   max_hypercube_rows: 10000

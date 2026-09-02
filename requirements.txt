@@ -1,10 +1,9 @@
 # Core dependencies
-mcp>=1.0.0
-websockets>=12.0
+# The MCP SDK v2 bundles the HTTP stack (starlette, uvicorn, sse-starlette)
+# used by the streamable-http and sse transports.
+mcp>=2.0.0,<3
+websockets>=13.0
 httpx>=0.27.0
 pyyaml>=6.0.1
-pydantic>=2.5.0
-
-# Optional: SSE transport
-# uvicorn>=0.27.0
-# starlette>=0.36.0
+pydantic>=2.12.0
+annotated-types>=0.6.0

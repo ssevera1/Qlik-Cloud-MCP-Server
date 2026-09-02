@@ -1,6 +1,7 @@
 """Authentication module for Qlik Cloud API access.
 
 Supports API key (bearer token) and OAuth2 M2M (client credentials grant).
+Reference: https://qlik.dev/authenticate/oauth/getting-started-oauth-m2m/
 """
 
 from __future__ import annotations
@@ -9,6 +10,7 @@ import json
 import logging
 import time
 from typing import Optional
+from urllib.parse import urlparse
 
 import httpx
 
@@ -24,8 +26,11 @@ class AuthError(Exception):
 class AuthManager:
     """Manages authentication credentials for Qlik Cloud APIs."""
 
-    def __init__(self, config: Config) -> None:
+    def __init__(
+        self, config: Config, transport: Optional[httpx.AsyncBaseTransport] = None
+    ) -> None:
         self.config = config
+        self._transport = transport
         self._access_token: Optional[str] = None
         self._token_expiry: float = 0.0
 
@@ -41,34 +46,24 @@ class AuthManager:
     async def get_ws_headers(self) -> dict[str, str]:
         """Get headers for WebSocket connections to the Engine API."""
         token = await self._get_token()
-        return {
-            "Authorization": f"Bearer {token}",
-        }
+        return {"Authorization": f"Bearer {token}"}
 
     async def _get_token(self) -> str:
         """Get a valid access token, refreshing if necessary."""
         if self.config.auth_mode == "api_key":
             return self.config.qlik.api_key
 
-        # OAuth2 M2M — check if cached token is still valid
         if self._access_token and time.time() < self._token_expiry - 60:
             return self._access_token
 
         return await self._refresh_oauth_token()
 
-    async def _refresh_oauth_token(self) -> str:
-        """Acquire a new OAuth2 access token via client credentials grant."""
+    def _token_url(self) -> str:
         oauth = self.config.qlik.oauth
-        if not oauth:
-            raise AuthError("OAuth configuration is missing")
+        token_url = (oauth.token_url if oauth else "") or f"{self.config.qlik.tenant_url}/oauth/token"
 
-        token_url = oauth.token_url
-        if not token_url:
-            token_url = f"{self.config.qlik.tenant_url}/oauth/token"
-
-        # Validate token_url is under the tenant domain to prevent SSRF
+        # The token endpoint must live on the tenant to prevent credential leakage / SSRF.
         tenant_host = self.config.tenant_host
-        from urllib.parse import urlparse
         parsed = urlparse(token_url)
         if parsed.scheme != "https":
             raise AuthError("token_url must use HTTPS")
@@ -76,21 +71,27 @@ class AuthManager:
             parsed.hostname != tenant_host
             and not parsed.hostname.endswith("." + tenant_host)
         ):
-            raise AuthError(
-                "token_url must be under the configured tenant domain"
-            )
+            raise AuthError("token_url must be under the configured tenant domain")
+        return token_url
 
+    async def _refresh_oauth_token(self) -> str:
+        """Acquire a new OAuth2 access token via client credentials grant."""
+        oauth = self.config.qlik.oauth
+        if not oauth:
+            raise AuthError("OAuth configuration is missing")
+
+        token_url = self._token_url()
         logger.debug("Refreshing OAuth2 token from %s", token_url)
 
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=30, transport=self._transport) as client:
             response = await client.post(
                 token_url,
-                data={
-                    "grant_type": "client_credentials",
+                json={
                     "client_id": oauth.client_id,
                     "client_secret": oauth.client_secret,
+                    "grant_type": "client_credentials",
                 },
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                headers={"Accept": "application/json", "Content-Type": "application/json"},
             )
 
             if response.status_code != 200:
@@ -105,7 +106,7 @@ class AuthManager:
             try:
                 data = response.json()
             except (json.JSONDecodeError, ValueError) as e:
-                raise AuthError(f"OAuth2 response is not valid JSON: {e}")
+                raise AuthError("OAuth2 response is not valid JSON") from e
 
         self._access_token = data.get("access_token")
         if not self._access_token:

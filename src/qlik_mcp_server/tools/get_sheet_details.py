@@ -1,9 +1,9 @@
-"""qlik_get_sheet_details — Inspect existing dashboard layouts.
+"""qlik_get_sheet_details: inspect existing dashboard layouts.
 
-This tool allows AI agents to "see" the layout of existing Qlik dashboards.
-Before answering a user's question, an agent can check if a visualization
-already exists that answers the query, preventing hallucination of
-non-existent metrics.
+This tool lets AI agents "see" the layout of existing Qlik dashboards.
+Before answering a user's question, an agent can check whether a
+visualization already exists that answers the query, which prevents
+hallucination of non-existent metrics.
 """
 
 from __future__ import annotations
@@ -21,52 +21,42 @@ logger = logging.getLogger(__name__)
 class GetSheetDetailsInput(BaseModel):
     """Input schema for qlik_get_sheet_details."""
 
-    app_id: str = Field(
-        description="The Qlik Cloud app ID to inspect"
-    )
+    app_id: str = Field(description="The Qlik Cloud app ID to inspect")
     sheet_id: Optional[str] = Field(
         default=None,
-        description="Specific sheet ID to get details for. If omitted, returns all sheets."
+        description="Specific sheet ID to get details for. If omitted, returns all sheets.",
     )
 
 
 TOOL_DESCRIPTION = (
     "Get the layout and visualization details of sheets in a Qlik Cloud app. "
     "Use this to inspect what dashboards already exist before creating new analysis. "
-    "Returns sheet titles, descriptions, and the types of visualizations on each sheet. "
+    "Returns sheet titles, descriptions, and the id, type, title, and grid position "
+    "of each visualization on the sheet. "
     "If no sheet_id is provided, returns a summary of all sheets in the app."
 )
 
 
-async def handle_get_sheet_details(
-    engine: EngineClient, params: dict
-) -> dict:
+async def handle_get_sheet_details(engine: EngineClient, params: dict) -> dict:
     """Execute the qlik_get_sheet_details tool."""
     input_data = GetSheetDetailsInput(**params)
 
     try:
         async with engine.open_app(input_data.app_id) as session:
             if input_data.sheet_id:
-                # Get specific sheet layout
                 layout = await session.get_sheet_layout(input_data.sheet_id)
-                cells = session._extract_cells(layout)
-                meta = layout.get("qMeta", {})
-
-                return {
-                    "sheet_id": input_data.sheet_id,
-                    "title": meta.get("title", ""),
-                    "description": meta.get("description", ""),
-                    "objects": cells,
-                    "object_count": len(cells),
-                }
-            else:
-                # List all sheets
-                sheets = await session.get_sheets()
                 return {
                     "app_id": input_data.app_id,
-                    "sheet_count": len(sheets),
-                    "sheets": sheets,
+                    "sheet_id": input_data.sheet_id,
+                    **session.describe_sheet(layout),
                 }
+
+            sheets = await session.get_sheets()
+            return {
+                "app_id": input_data.app_id,
+                "sheet_count": len(sheets),
+                "sheets": sheets,
+            }
 
     except EngineError as e:
         logger.error("Engine error in get_sheet_details: %s", e)

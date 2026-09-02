@@ -5,13 +5,23 @@ Class-level detail showing key relationships.
 ```mermaid
 classDiagram
     class Config {
+        +qlik: QlikConfig
+        +server: ServerConfig
+        +tools: ToolSettings
+        +load(path) Config$
+        +from_env() Config$
+        +validate() list~str~
+        +auth_mode: str
+        +tenant_host: str
+    }
+
+    class QlikConfig {
         +tenant_url: str
         +api_key: str
         +oauth: OAuthConfig
-        +transport: str
-        +tool_settings: ToolSettings
-        +load(path: str) Config$
-        +validate() list~str~
+        +default_app_id: str
+        +timeout_seconds: int
+        +max_retries: int
     }
 
     class OAuthConfig {
@@ -20,11 +30,20 @@ classDiagram
         +token_url: str
     }
 
+    class ServerConfig {
+        +transport: str
+        +http_host: str
+        +http_port: int
+        +http_path: str
+        +log_level: str
+    }
+
     class ToolSettings {
+        +search: bool
+        +get_fields: bool
         +get_sheet_details: bool
         +get_hypercube_data: bool
         +create_sheet: bool
-        +search: bool
         +max_hypercube_rows: int
         +max_hypercube_columns: int
         +allow_sheet_creation: bool
@@ -33,10 +52,12 @@ classDiagram
 
     class AuthManager {
         -config: Config
+        -_transport: httpx transport (tests)
         -_access_token: str
-        -_token_expiry: datetime
+        -_token_expiry: float
         +get_rest_headers() dict
         +get_ws_headers() dict
+        -_token_url() str
         -_refresh_oauth_token() str
     }
 
@@ -44,11 +65,12 @@ classDiagram
         -config: Config
         -auth: AuthManager
         -_client: httpx.AsyncClient
-        +search_items(query, resource_type, space, limit) list~dict~
+        +search_items(query, resource_type, space_id, limit) list~dict~
         +get_app(app_id) dict
-        +list_apps(space_id) list~dict~
+        +list_apps(space_id, limit) list~dict~
         +get_spaces() list~dict~
         +close()
+        -_request(method, path, params, json_data)
     }
 
     class EngineClient {
@@ -58,19 +80,22 @@ classDiagram
     }
 
     class EngineSession {
-        -ws: WebSocket
-        -doc_handle: int
+        -_ws: WebSocket
+        -_doc_handle: int
         -_request_id: int
         +get_sheets() list~dict~
         +get_sheet_layout(sheet_id) dict
         +get_object_layout(object_id) dict
-        +create_hypercube(dimensions, measures, page_size) HypercubeResult
+        +describe_sheet(layout) dict$
+        +get_fields() list~dict~
+        +create_hypercube(dimensions, measures, page_size, max_rows) HypercubeResult
         +apply_selections(field, values) bool
         +clear_selections()
-        +create_sheet(title, objects) dict
+        +create_sheet(title, description, objects) dict
         +close()
-        -_send(method, handle, params) dict
-        -_next_id() int
+        -_send(method, handle, params)
+        -_layout_cells(created) list~dict~$
+        -_build_child_props(obj_def) dict$
     }
 
     class HypercubeResult {
@@ -82,20 +107,26 @@ classDiagram
         +to_records() list~dict~
     }
 
-    class MCPServer {
-        -config: Config
-        -qlik_client: QlikCloudClient
-        -engine_client: EngineClient
-        +run(transport) void
-        -_register_tools()
-        -_handle_get_sheet_details(params) ToolResult
-        -_handle_get_hypercube_data(params) ToolResult
-        -_handle_create_sheet(params) ToolResult
-        -_handle_search(params) ToolResult
+    class server_py {
+        +TOOL_NAMES
+        +create_server(config, qlik_client?, engine_client?) MCPServer
+        +run_server(config)
+        +transport_security_for(config)
+        -_guarded(tool_name, call) dict
     }
 
-    Config --* OAuthConfig
+    class MCPServer {
+        <<mcp SDK v2>>
+        +add_tool(fn, name, description, annotations)
+        +list_tools()
+        +call_tool(name, arguments)
+        +run(transport, ...)
+    }
+
+    Config --* QlikConfig
+    Config --* ServerConfig
     Config --* ToolSettings
+    QlikConfig --* OAuthConfig
     AuthManager --> Config
     QlikCloudClient --> Config
     QlikCloudClient --> AuthManager
@@ -103,9 +134,10 @@ classDiagram
     EngineClient --> AuthManager
     EngineClient ..> EngineSession : creates
     EngineSession ..> HypercubeResult : returns
-    MCPServer --> Config
-    MCPServer --> QlikCloudClient
-    MCPServer --> EngineClient
+    server_py --> Config
+    server_py --> QlikCloudClient
+    server_py --> EngineClient
+    server_py ..> MCPServer : builds
 ```
 
 ## Key Design Patterns
@@ -114,20 +146,30 @@ classDiagram
 Each tool invocation opens a fresh WebSocket connection, performs the operation, and closes. This keeps the MCP server stateless and avoids session management complexity.
 
 ```python
-async def _handle_get_hypercube_data(self, params):
-    async with self.engine_client.open_app(params["app_id"]) as session:
+async def handle_get_hypercube_data(engine, params, max_rows_limit=10000, max_columns_limit=50):
+    input_data = GetHypercubeDataInput(**params)
+    async with engine.open_app(input_data.app_id) as session:
+        for f in input_data.filters or []:
+            await session.apply_selections(f.field, f.values)
         result = await session.create_hypercube(
-            dimensions=params["dimensions"],
-            measures=params["measures"],
+            dimensions=input_data.dimensions,
+            measures=input_data.measures,
+            max_rows=min(input_data.max_rows or 1000, max_rows_limit),
         )
-    return result.to_records()
+    return {"headers": result.headers, "data": result.rows, ...}
 ```
 
 ### Async Context Manager for Engine Sessions
-`EngineSession` implements `__aenter__`/`__aexit__` to ensure WebSocket connections are always properly closed, even on errors.
+`EngineClient.open_app()` is an `asynccontextmanager`: it validates the app id, connects, calls `OpenDoc`, yields an `EngineSession`, and always closes the socket, even on errors.
+
+### Handlers take dicts, the SDK sees flat signatures
+Each tool module exposes a `handle_*` coroutine that accepts a plain dict and returns a plain dict. `server.py` wraps each handler in a function with flat, typed parameters whose descriptions and constraints are copied from the Pydantic input model, then registers it with `MCPServer.add_tool()`. The Pydantic model stays the single source of truth; the SDK generates the JSON Schema from the wrapper signature.
 
 ### Pydantic Input Validation
-Tool input parameters are validated using Pydantic models before being passed to handlers, providing clear error messages when agents send malformed requests.
+Tool inputs are validated twice: by the SDK against the generated schema, and again by the Pydantic model inside the handler (which also runs custom validators such as the allowed resource types). Validation failures become `{"error": "Invalid input: ..."}` payloads.
+
+### Error Sanitization
+`_guarded()` in `server.py` maps failures to agent-readable payloads. Engine and REST errors keep their message (bounded to 500 characters). Authentication and unexpected errors are logged in full but reported generically so credentials and stack details never reach the model.
 
 ### MCP SDK Integration
-The `mcp` SDK handles protocol serialization, transport negotiation, and tool schema exposure. The server only implements the tool handler functions.
+The `mcp` SDK handles protocol serialization, transport negotiation, structured output, and schema exposure. The server only implements the tool functions and picks the transport in `run_server()`.
