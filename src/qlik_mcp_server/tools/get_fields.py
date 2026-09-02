@@ -12,6 +12,7 @@ import logging
 from pydantic import BaseModel, Field
 
 from ..engine_client import EngineClient, EngineError
+from .spec import ToolSpec
 
 logger = logging.getLogger(__name__)
 
@@ -49,3 +50,12 @@ async def handle_get_fields(engine: EngineClient, params: dict) -> dict:
             "app_id": input_data.app_id,
             "hint": "Verify the app_id exists and the service account has access.",
         }
+
+
+GET_FIELDS_SPEC = ToolSpec(
+    name="qlik_get_fields",
+    title="List app fields",
+    description=TOOL_DESCRIPTION,
+    input_model=GetFieldsInput,
+    run=lambda ctx, params: handle_get_fields(ctx.engine, params),
+)

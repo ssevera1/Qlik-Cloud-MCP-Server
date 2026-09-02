@@ -38,7 +38,15 @@ server:
   log_level: INFO
 
 tools:
-  # Enable/disable specific tools
+  # Hide tools by name. All 16 tools are enabled by default:
+  #   qlik_search, qlik_describe_app, qlik_get_fields, qlik_get_field_values,
+  #   qlik_search_field_values, qlik_list_sheets, qlik_get_sheet_details,
+  #   qlik_get_chart_info, qlik_get_chart_data, qlik_list_dimensions,
+  #   qlik_list_measures, qlik_list_bookmarks, qlik_get_hypercube_data,
+  #   qlik_create_sheet, qlik_add_chart, qlik_add_filter
+  disabled_tools: []
+
+  # Legacy per-tool switches (still honored)
   search: true
   get_fields: true
   get_sheet_details: true
@@ -49,6 +57,7 @@ tools:
   max_hypercube_rows: 10000
   max_hypercube_columns: 50
 
-  # Sheet creation
+  # Write tools (qlik_create_sheet, qlik_add_chart, qlik_add_filter).
+  # Set to false for a read-only server; the three tools are then not registered.
   allow_sheet_creation: true
   created_sheet_prefix: "[Agent] "

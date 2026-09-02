@@ -1,4 +1,4 @@
-"""qlik_get_hypercube_data — Primary governed data retrieval tool.
+"""qlik_get_hypercube_data: primary governed data retrieval tool.
 
 This is the main data access tool. The agent can request specific slices
 of data (hypercubes) from the Qlik engine with dimensions and measures.
@@ -13,6 +13,7 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 from ..engine_client import EngineClient, EngineError
+from .spec import ToolSpec
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,14 @@ class GetHypercubeDataInput(BaseModel):
             "Example: [{field: 'Year', values: ['2025']}, {field: 'Region', values: ['East', 'West']}]"
         ),
     )
+    bookmark_id: Optional[str] = Field(
+        default=None,
+        max_length=256,
+        description=(
+            "Optional bookmark id (see qlik_list_bookmarks). The bookmark's selections are applied "
+            "before any filters, so the data reflects that saved view."
+        ),
+    )
     max_rows: Optional[int] = Field(
         default=1000,
         ge=1,
@@ -65,9 +74,10 @@ class GetHypercubeDataInput(BaseModel):
 TOOL_DESCRIPTION = (
     "Retrieve aggregated data from a Qlik Cloud app as a table with dimensions and measures. "
     "Dimensions define the grouping (e.g., Region, Product) and measures define the calculations "
-    "(e.g., Sum(Revenue), Count(Orders)). Data is governed by Qlik Section Access security — "
-    "only data the service account is authorized to see will be returned. "
-    "Use filters to narrow the data before retrieval."
+    "(e.g., Sum(Revenue), Count(Orders)); master measure expressions from qlik_list_measures "
+    "can be used directly. Data is governed by Qlik Section Access security: only data the "
+    "service account is authorized to see is returned. Use filters, or a bookmark_id, to narrow "
+    "the data before retrieval."
 )
 
 
@@ -95,6 +105,16 @@ async def handle_get_hypercube_data(
 
     try:
         async with engine.open_app(input_data.app_id) as session:
+            bookmark_applied = None
+            if input_data.bookmark_id:
+                if not await session.apply_bookmark(input_data.bookmark_id):
+                    return {
+                        "error": f"Bookmark not found or could not be applied: {input_data.bookmark_id}",
+                        "app_id": input_data.app_id,
+                        "hint": "List valid bookmark ids with qlik_list_bookmarks.",
+                    }
+                bookmark_applied = True
+
             # Apply filters if provided; remember any the engine could not match.
             unmatched: list[dict] = []
             for f in input_data.filters or []:
@@ -123,6 +143,8 @@ async def handle_get_hypercube_data(
                     if {"field": f.field, "values": f.values} not in unmatched
                 ],
                 "filters_not_matched": unmatched,
+                "bookmark_id": input_data.bookmark_id,
+                "bookmark_applied": bookmark_applied,
                 "table": result.to_table(),
             }
             if unmatched:
@@ -143,3 +165,16 @@ async def handle_get_hypercube_data(
                 "and measure expressions use valid Qlik syntax (e.g., Sum(FieldName))."
             ),
         }
+
+
+GET_HYPERCUBE_DATA_SPEC = ToolSpec(
+    name="qlik_get_hypercube_data",
+    title="Get governed data",
+    description=TOOL_DESCRIPTION,
+    input_model=GetHypercubeDataInput,
+    run=lambda ctx, params: handle_get_hypercube_data(
+        ctx.engine, params,
+        max_rows_limit=ctx.config.tools.max_hypercube_rows,
+        max_columns_limit=ctx.config.tools.max_hypercube_columns,
+    ),
+)

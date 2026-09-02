@@ -44,3 +44,25 @@ We need to decide how many MCP tools to expose and how specific each should be. 
 ## Update 2026-09-02
 
 A fifth tool, `qlik_get_fields`, was added. Agents had no way to discover valid field names before calling `qlik_get_hypercube_data`, which made the primary data tool guesswork on unfamiliar apps. Field discovery is a distinct read-only capability (it maps to the engine's field list), so it fits the one-tool-per-capability rule and stays within the "fewer than about six tools" guidance. The tool names continue to mirror the naming used by Qlik's own hosted MCP server (`qlik_search`, `qlik_get_sheet_details`, `qlik_create_sheet`, `qlik_get_fields`).
+
+## Update 2026-09-02 (later the same day): parity with Qlik's hosted MCP server
+
+Qlik's hosted MCP server exposes roughly ninety tools across analytics apps, automations, data products, datasets, glossaries, lineage, and knowledge bases. Agents and prompts written against it expect a particular vocabulary. This server now implements the analytics-app subset with the same names and semantics, sixteen tools in five groups:
+
+| Group | Tools |
+|-------|-------|
+| Discover | `qlik_search`, `qlik_describe_app` |
+| Data model | `qlik_get_fields`, `qlik_get_field_values`, `qlik_search_field_values`, `qlik_list_dimensions`, `qlik_list_measures`, `qlik_list_bookmarks` |
+| Dashboards | `qlik_list_sheets`, `qlik_get_sheet_details`, `qlik_get_chart_info`, `qlik_get_chart_data` |
+| Compute | `qlik_get_hypercube_data` (with `filters` and `bookmark_id`) |
+| Build | `qlik_create_sheet`, `qlik_add_chart`, `qlik_add_filter` |
+
+Why sixteen is still consistent with this ADR: each tool maps to exactly one capability with a distinct schema, the tools are ordered as a workflow so selection is easy, and any tool can be hidden with `tools.disabled_tools`. Current models select reliably among tools of this count when descriptions do not overlap; the "about six" guidance above reflected 2025-era concerns and is superseded.
+
+Deliberately out of scope, and why:
+
+- **Selection tools** (`qlik_select_values`, `qlik_clear_selections`, `qlik_get_current_selections`): ADR-004 keeps calls stateless, so selections are parameters of `qlik_get_hypercube_data` (filters, bookmark) rather than session state.
+- **Create, update, delete of master items, bookmarks, and apps**: the write surface stays additive (three tools that only add objects). Deletion and mutation of governed definitions by an agent needs a human approval loop this server does not provide.
+- **Automations, data products, datasets, glossaries, lineage, knowledge bases**: different REST APIs and different personas; Qlik's hosted server covers them.
+
+The registry (`tools/registry.py`) is the single place to add a tool: one `ToolSpec` with a Pydantic input model and a handler.

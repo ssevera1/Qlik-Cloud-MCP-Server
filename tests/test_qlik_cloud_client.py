@@ -72,3 +72,28 @@ class TestSearchItems:
 
         with pytest.raises(QlikCloudError, match="Could not reach"):
             await _client(handler).search_items("x")
+
+
+class TestAppEndpoints:
+    async def test_get_app_returns_attributes(self):
+        def handler(request):
+            assert request.url.path == f"/api/v1/apps/{APP_ID}"
+            return httpx.Response(200, json={"attributes": {"id": APP_ID, "name": "Sales"}})
+
+        app = await _client(handler).get_app(APP_ID)
+        assert app["name"] == "Sales"
+
+    async def test_get_app_rejects_non_uuid(self):
+        with pytest.raises(QlikCloudError, match="UUID"):
+            await _client(lambda r: httpx.Response(200, json={})).get_app("../admin")
+
+    async def test_get_app_data_metadata(self):
+        seen = {}
+
+        def handler(request):
+            seen["path"] = request.url.path
+            return httpx.Response(200, json={"fields": [{"name": "Region"}], "tables": [{"name": "Sales"}]})
+
+        meta = await _client(handler).get_app_data_metadata(APP_ID)
+        assert seen["path"] == f"/api/v1/apps/{APP_ID}/data/metadata"
+        assert meta["tables"][0]["name"] == "Sales"

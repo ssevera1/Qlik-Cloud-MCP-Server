@@ -14,6 +14,7 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 from ..engine_client import EngineClient, EngineError
+from .spec import ToolSpec
 
 logger = logging.getLogger(__name__)
 
@@ -65,3 +66,12 @@ async def handle_get_sheet_details(engine: EngineClient, params: dict) -> dict:
             "app_id": input_data.app_id,
             "hint": "Verify the app_id exists and the service account has access.",
         }
+
+
+GET_SHEET_DETAILS_SPEC = ToolSpec(
+    name="qlik_get_sheet_details",
+    title="Inspect sheets",
+    description=TOOL_DESCRIPTION,
+    input_model=GetSheetDetailsInput,
+    run=lambda ctx, params: handle_get_sheet_details(ctx.engine, params),
+)

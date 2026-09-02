@@ -12,6 +12,7 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 from ..engine_client import EngineClient, EngineError
+from .spec import ToolSpec
 
 logger = logging.getLogger(__name__)
 
@@ -149,3 +150,17 @@ async def handle_create_sheet(
             "app_id": input_data.app_id,
             "hint": "Verify the app_id and ensure the service account has edit access to the app.",
         }
+
+
+CREATE_SHEET_SPEC = ToolSpec(
+    name="qlik_create_sheet",
+    title="Create sheet",
+    description=TOOL_DESCRIPTION,
+    input_model=CreateSheetInput,
+    run=lambda ctx, params: handle_create_sheet(
+        ctx.engine, params,
+        sheet_prefix=ctx.config.tools.created_sheet_prefix,
+        allow_creation=ctx.config.tools.allow_sheet_creation,
+    ),
+    writes=True,
+)

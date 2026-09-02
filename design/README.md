@@ -25,7 +25,7 @@ Architecture documentation for the Qlik Cloud MCP Server, the standardized integ
 
 ## Keeping these current
 
-The diagrams describe the code as of version 0.2.0. When a tool is added or a transport changes, update the C2 container list, the C3 sequences, the C4 class diagram, and the relevant ADR in the same change.
+The diagrams describe the code as of version 0.3.0. When a tool is added or a transport changes, update the C2 container list, the C3 sequences, the C4 class diagram, and the relevant ADR in the same change.
 
 ## Rendering Diagrams
 

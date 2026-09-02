@@ -197,6 +197,13 @@ class QlikCloudClient:
             raise QlikCloudError(f"App not found: {app_id}", status_code=404)
         return result.get("attributes", result)
 
+    async def get_app_data_metadata(self, app_id: str) -> dict:
+        """Data model metadata for an app: fields, tables, reload statistics."""
+        if not _UUID_RE.fullmatch(app_id):
+            raise QlikCloudError("Invalid app_id: expected UUID format")
+        result = await self._request("GET", f"/api/v1/apps/{app_id}/data/metadata")
+        return result if isinstance(result, dict) else {}
+
     async def list_apps(
         self, space_id: Optional[str] = None, limit: int = 50
     ) -> list[dict]:

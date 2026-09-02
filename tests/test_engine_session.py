@@ -24,7 +24,7 @@ def _basic_responder(sheet_layouts=None) -> FakeWebSocket:
             state["last_object"] = msg["params"][0]
             return {"qReturn": {"qType": "GenericObject", "qHandle": OBJ_HANDLE}}
         if method == "GetLayout" and msg["handle"] == OBJ_HANDLE:
-            return sheet_layouts.get(state["last_object"], {})
+            return {"qLayout": sheet_layouts.get(state["last_object"], {})}
         if method == "CreateObject":
             return {
                 "qInfo": {"qId": "new-sheet", "qType": "sheet"},
@@ -44,12 +44,12 @@ def _basic_responder(sheet_layouts=None) -> FakeWebSocket:
         if method in ("SetProperties", "DoSave"):
             return {}
         if method == "GetLayout" and msg["handle"] == SESSION_HANDLE:
-            return {"qFieldList": {"qItems": [
+            return {"qLayout": {"qFieldList": {"qItems": [
                 {"qName": "Region", "qCardinal": 4, "qTags": ["$ascii", "$text"],
                  "qSrcTables": ["Sales"], "qIsSystem": False, "qIsHidden": False},
                 {"qName": "$Field", "qCardinal": 1, "qTags": ["$system"],
                  "qSrcTables": [], "qIsSystem": True, "qIsHidden": True},
-            ]}}
+            ]}}}
         return {}
 
     return FakeWebSocket(responder)
@@ -212,3 +212,37 @@ class TestSelections:
 
         assert ok is False
         assert ws.calls("SelectValues")[0]["params"][0] == [{"qText": "Nowhere"}]
+
+
+class TestRawEngineResultShapes:
+    """The raw JSON-RPC engine wraps results by parameter name; enigma.js hides that, we must not."""
+
+    async def test_get_layout_result_is_unwrapped_from_qlayout(self):
+        ws = FakeWebSocket(lambda m: {"qReturn": {"qHandle": 2}} if m["method"] == "GetObject"
+                           else {"qLayout": {"qMeta": {"title": "Wrapped"}, "cells": []}})
+        session = EngineSession(ws, doc_handle=DOC, app_id="app")
+
+        layout = await session.get_object_layout("s1")
+
+        assert layout["qMeta"]["title"] == "Wrapped"
+
+    async def test_hypercube_paging_reads_qdatapages_wrapper(self):
+        def responder(msg):
+            if msg["method"] == "CreateSessionObject":
+                return {"qReturn": {"qHandle": 4}}
+            if msg["method"] == "GetLayout":
+                return {"qLayout": {"qHyperCube": {
+                    "qDimensionInfo": [{"qFallbackTitle": "A"}], "qMeasureInfo": [],
+                    "qSize": {"qcx": 1, "qcy": 3},
+                    "qDataPages": [{"qMatrix": [[{"qText": "r0"}]]}],
+                }}}
+            if msg["method"] == "GetHyperCubeData":
+                return {"qDataPages": [{"qMatrix": [[{"qText": "r1"}], [{"qText": "r2"}]]}]}
+            return {}
+
+        session = EngineSession(FakeWebSocket(responder), doc_handle=DOC, app_id="app")
+
+        result = await session.create_hypercube(["A"], [], page_size=1, max_rows=10)
+
+        assert result.rows == [["r0"], ["r1"], ["r2"]]
+        assert result.truncated is False

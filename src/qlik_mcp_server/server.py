@@ -1,13 +1,14 @@
 """MCP server definition and tool registration.
 
-Built on the MCP Python SDK v2 high-level ``MCPServer``. Each Qlik tool is
-registered with a flat, typed signature (so agents see a plain JSON schema)
-and returns a JSON object, which the SDK emits as both text and structured
-content.
+Built on the MCP Python SDK v2 high-level ``MCPServer``. Each tool in the
+registry is exposed with a flat, typed signature generated from its Pydantic
+input model (so agents see a plain JSON schema) and returns a JSON object,
+which the SDK emits as both text and structured content.
 """
 
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import Annotated, Any, Awaitable, Callable, Optional
 
@@ -15,79 +16,56 @@ from annotated_types import Ge, Gt, Le, Lt, MaxLen, MinLen
 from mcp.server import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
-from pydantic import Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError
+from pydantic.fields import FieldInfo
 
 from . import __version__
 from .auth import AuthError, AuthManager
 from .config import Config
 from .engine_client import EngineClient, EngineError
 from .qlik_cloud_client import QlikCloudClient, QlikCloudError
-from .tools.create_sheet import (
-    TOOL_DESCRIPTION as CREATE_SHEET_DESC,
-    CreateSheetInput,
-    VisualizationObject,
-    handle_create_sheet,
-)
-from .tools.get_fields import (
-    TOOL_DESCRIPTION as GET_FIELDS_DESC,
-    GetFieldsInput,
-    handle_get_fields,
-)
-from .tools.get_hypercube_data import (
-    TOOL_DESCRIPTION as HYPERCUBE_DESC,
-    Filter,
-    GetHypercubeDataInput,
-    handle_get_hypercube_data,
-)
-from .tools.get_sheet_details import (
-    TOOL_DESCRIPTION as SHEET_DETAILS_DESC,
-    GetSheetDetailsInput,
-    handle_get_sheet_details,
-)
-from .tools.search import (
-    TOOL_DESCRIPTION as SEARCH_DESC,
-    SearchInput,
-    handle_search,
-)
+from .tools.registry import TOOL_NAMES, TOOL_SPECS, enabled_specs
+from .tools.spec import ToolContext, ToolSpec
+
+__all__ = ["TOOL_NAMES", "TOOL_SPECS", "create_server", "run_server", "transport_security_for"]
 
 logger = logging.getLogger(__name__)
 
-TOOL_NAMES = (
-    "qlik_search",
-    "qlik_get_fields",
-    "qlik_get_sheet_details",
-    "qlik_get_hypercube_data",
-    "qlik_create_sheet",
-)
-
 SERVER_INSTRUCTIONS = (
-    "Tools for working with Qlik Cloud analytics apps. Typical flow: "
-    "qlik_search to find an app (use its resource_id as app_id), "
-    "qlik_get_fields to learn the field names, qlik_get_sheet_details to see "
-    "existing dashboards, qlik_get_hypercube_data to retrieve governed aggregated "
-    "data, and qlik_create_sheet to build a new sheet when nothing existing answers "
-    "the question. All data access is governed by Qlik Section Access."
+    "Tools for working with Qlik Cloud analytics apps. Typical flow: qlik_search to find an app "
+    "(use its resource_id as app_id), qlik_describe_app for an overview, qlik_get_fields and "
+    "qlik_list_measures to learn field names and governed measure definitions, qlik_list_sheets "
+    "and qlik_get_sheet_details to see existing dashboards, qlik_get_chart_data to read a chart "
+    "as shown, qlik_get_hypercube_data to compute governed aggregated data (optionally under a "
+    "bookmark or filters), and qlik_create_sheet / qlik_add_chart / qlik_add_filter to build "
+    "dashboards when nothing existing answers the question. All data access is governed by "
+    "Qlik Section Access."
 )
-
 
 _CONSTRAINT_KWARGS = {
     Ge: "ge", Gt: "gt", Le: "le", Lt: "lt", MinLen: "min_length", MaxLen: "max_length",
 }
 
 
-def _field(model: type, name: str) -> Any:
-    """Reuse a Pydantic model's field description and constraints in a tool signature.
-
-    Defaults are deliberately not copied: the tool function's own default
-    is the single source of truth for the generated JSON schema.
-    """
-    src = model.model_fields[name]
+def _field_meta(src: FieldInfo) -> Any:
+    """Copy a model field's description and constraints into a fresh Field for a signature."""
     kwargs: dict[str, Any] = {"description": src.description}
     for constraint in src.metadata:
         for cls, kw in _CONSTRAINT_KWARGS.items():
             if isinstance(constraint, cls):
                 kwargs[kw] = getattr(constraint, kw)
     return Field(**kwargs)
+
+
+def _plain(value: Any) -> Any:
+    """Turn validated argument values (which may be Pydantic models) into plain data."""
+    if isinstance(value, BaseModel):
+        return value.model_dump()
+    if isinstance(value, list):
+        return [_plain(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _plain(v) for k, v in value.items()}
+    return value
 
 
 def _validation_error_payload(e: ValidationError, **context: Any) -> dict:
@@ -117,6 +95,35 @@ async def _guarded(tool_name: str, call: Callable[[], Awaitable[dict]]) -> dict:
                 "hint": "Check the server logs for details."}
 
 
+def _make_tool_function(spec: ToolSpec, ctx: ToolContext) -> Callable[..., Awaitable[dict[str, Any]]]:
+    """Build an async function whose signature mirrors the tool's Pydantic input model.
+
+    The SDK derives the JSON Schema from ``inspect.signature``, so the model's
+    field types, descriptions, constraints, and defaults become the schema.
+    The model itself is still applied inside the handler for custom validators.
+    """
+    parameters = []
+    for name, model_field in spec.input_model.model_fields.items():
+        annotation = Annotated[model_field.annotation, _field_meta(model_field)]
+        if model_field.is_required():
+            default = inspect.Parameter.empty
+        else:
+            default = model_field.get_default(call_default_factory=True)
+        parameters.append(inspect.Parameter(
+            name, inspect.Parameter.KEYWORD_ONLY, default=default, annotation=annotation,
+        ))
+
+    async def tool(**kwargs: Any) -> dict[str, Any]:
+        payload = {k: _plain(v) for k, v in kwargs.items()}
+        return await _guarded(spec.name, lambda: spec.run(ctx, payload))
+
+    tool.__name__ = spec.name
+    tool.__qualname__ = spec.name
+    tool.__doc__ = spec.description
+    tool.__signature__ = inspect.Signature(parameters, return_annotation=dict[str, Any])  # type: ignore[attr-defined]
+    return tool
+
+
 def create_server(
     config: Config,
     qlik_client: Optional[QlikCloudClient] = None,
@@ -124,109 +131,36 @@ def create_server(
 ) -> MCPServer:
     """Create and configure the MCP server with the enabled Qlik tools."""
     auth = AuthManager(config)
-    qlik_client = qlik_client or QlikCloudClient(config, auth)
-    engine_client = engine_client or EngineClient(config, auth)
+    ctx = ToolContext(
+        config=config,
+        qlik_client=qlik_client or QlikCloudClient(config, auth),
+        engine=engine_client or EngineClient(config, auth),
+    )
 
+    level = config.server.log_level.upper()
     mcp = MCPServer(
         "qlik-cloud-mcp-server",
         title="Qlik Cloud MCP Server",
         instructions=SERVER_INSTRUCTIONS,
         version=__version__,
-        log_level=config.server.log_level.upper()
-        if config.server.log_level.upper() in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
-        else "INFO",
+        log_level=level if level in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL") else "INFO",
     )
 
-    read_only = ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=False)
-    writes_app = ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=False)
+    read_only = ToolAnnotations(
+        read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False,
+    )
+    writes_app = ToolAnnotations(
+        read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False,
+    )
 
-    # ── qlik_search ───────────────────────────────────────────────
-    if config.tools.search:
-        async def qlik_search(
-            query: Annotated[str, _field(SearchInput, "query")],
-            resource_type: Annotated[Optional[str], _field(SearchInput, "resource_type")] = None,
-            space: Annotated[Optional[str], _field(SearchInput, "space")] = None,
-            limit: Annotated[Optional[int], _field(SearchInput, "limit")] = 20,
-        ) -> dict[str, Any]:
-            return await _guarded("qlik_search", lambda: handle_search(qlik_client, {
-                "query": query, "resource_type": resource_type, "space": space, "limit": limit,
-            }))
-
-        mcp.add_tool(qlik_search, name="qlik_search", title="Search Qlik catalog",
-                     description=SEARCH_DESC, annotations=read_only)
-
-    # ── qlik_get_fields ───────────────────────────────────────────
-    if config.tools.get_fields:
-        async def qlik_get_fields(
-            app_id: Annotated[str, _field(GetFieldsInput, "app_id")],
-        ) -> dict[str, Any]:
-            return await _guarded("qlik_get_fields", lambda: handle_get_fields(
-                engine_client, {"app_id": app_id},
-            ))
-
-        mcp.add_tool(qlik_get_fields, name="qlik_get_fields", title="List app fields",
-                     description=GET_FIELDS_DESC, annotations=read_only)
-
-    # ── qlik_get_sheet_details ────────────────────────────────────
-    if config.tools.get_sheet_details:
-        async def qlik_get_sheet_details(
-            app_id: Annotated[str, _field(GetSheetDetailsInput, "app_id")],
-            sheet_id: Annotated[Optional[str], _field(GetSheetDetailsInput, "sheet_id")] = None,
-        ) -> dict[str, Any]:
-            return await _guarded("qlik_get_sheet_details", lambda: handle_get_sheet_details(
-                engine_client, {"app_id": app_id, "sheet_id": sheet_id},
-            ))
-
-        mcp.add_tool(qlik_get_sheet_details, name="qlik_get_sheet_details",
-                     title="Inspect sheets", description=SHEET_DETAILS_DESC, annotations=read_only)
-
-    # ── qlik_get_hypercube_data ───────────────────────────────────
-    if config.tools.get_hypercube_data:
-        async def qlik_get_hypercube_data(
-            app_id: Annotated[str, _field(GetHypercubeDataInput, "app_id")],
-            dimensions: Annotated[list[str], _field(GetHypercubeDataInput, "dimensions")],
-            measures: Annotated[list[str], _field(GetHypercubeDataInput, "measures")],
-            filters: Annotated[Optional[list[Filter]], _field(GetHypercubeDataInput, "filters")] = None,
-            max_rows: Annotated[Optional[int], _field(GetHypercubeDataInput, "max_rows")] = 1000,
-        ) -> dict[str, Any]:
-            return await _guarded("qlik_get_hypercube_data", lambda: handle_get_hypercube_data(
-                engine_client,
-                {
-                    "app_id": app_id,
-                    "dimensions": dimensions,
-                    "measures": measures,
-                    "filters": [f.model_dump() for f in filters] if filters else None,
-                    "max_rows": max_rows,
-                },
-                max_rows_limit=config.tools.max_hypercube_rows,
-                max_columns_limit=config.tools.max_hypercube_columns,
-            ))
-
-        mcp.add_tool(qlik_get_hypercube_data, name="qlik_get_hypercube_data",
-                     title="Get governed data", description=HYPERCUBE_DESC, annotations=read_only)
-
-    # ── qlik_create_sheet ─────────────────────────────────────────
-    if config.tools.create_sheet:
-        async def qlik_create_sheet(
-            app_id: Annotated[str, _field(CreateSheetInput, "app_id")],
-            title: Annotated[str, _field(CreateSheetInput, "title")],
-            description: Annotated[Optional[str], _field(CreateSheetInput, "description")] = "",
-            objects: Annotated[Optional[list[VisualizationObject]], _field(CreateSheetInput, "objects")] = None,
-        ) -> dict[str, Any]:
-            return await _guarded("qlik_create_sheet", lambda: handle_create_sheet(
-                engine_client,
-                {
-                    "app_id": app_id,
-                    "title": title,
-                    "description": description,
-                    "objects": [o.model_dump() for o in (objects or [])],
-                },
-                sheet_prefix=config.tools.created_sheet_prefix,
-                allow_creation=config.tools.allow_sheet_creation,
-            ))
-
-        mcp.add_tool(qlik_create_sheet, name="qlik_create_sheet", title="Create sheet",
-                     description=CREATE_SHEET_DESC, annotations=writes_app)
+    for spec in enabled_specs(config):
+        mcp.add_tool(
+            _make_tool_function(spec, ctx),
+            name=spec.name,
+            title=spec.title,
+            description=spec.description,
+            annotations=writes_app if spec.writes else read_only,
+        )
 
     return mcp
 

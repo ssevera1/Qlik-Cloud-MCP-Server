@@ -105,22 +105,19 @@ def main() -> int:
         return 1
 
     if args.validate:
-        enabled = [
-            name for name, flag in (
-                ("qlik_search", config.tools.search),
-                ("qlik_get_fields", config.tools.get_fields),
-                ("qlik_get_sheet_details", config.tools.get_sheet_details),
-                ("qlik_get_hypercube_data", config.tools.get_hypercube_data),
-                ("qlik_create_sheet", config.tools.create_sheet),
-            ) if flag
-        ]
+        from .tools.registry import TOOL_NAMES, enabled_specs
+
+        unknown = sorted(set(config.tools.disabled_tools) - set(TOOL_NAMES))
+        for name in unknown:
+            logging.warning("tools.disabled_tools names an unknown tool: %s", name)
+        enabled = [spec.name for spec in enabled_specs(config)]
         print("Configuration is valid.")
         print(f"  Tenant: {config.tenant_host}")
         print(f"  Auth: {config.auth_mode}")
         print(f"  Transport: {config.server.transport}")
         if config.server.transport != "stdio":
             print(f"  Bind: {config.server.http_host}:{config.server.http_port}")
-        print(f"  Tools enabled ({len(enabled)}): {', '.join(enabled)}")
+        print(f"  Tools enabled ({len(enabled)}/{len(TOOL_NAMES)}): {', '.join(enabled)}")
         return 0
 
     from .server import run_server

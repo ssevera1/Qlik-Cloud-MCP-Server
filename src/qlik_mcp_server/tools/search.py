@@ -13,6 +13,7 @@ from typing import Optional
 from pydantic import BaseModel, Field, field_validator
 
 from ..qlik_cloud_client import QlikCloudClient, QlikCloudError
+from .spec import ToolSpec
 
 logger = logging.getLogger(__name__)
 
@@ -104,3 +105,12 @@ async def handle_search(client: QlikCloudClient, params: dict) -> dict:
             "query": input_data.query,
             "hint": "Verify the tenant URL and API credentials are correct.",
         }
+
+
+SEARCH_SPEC = ToolSpec(
+    name="qlik_search",
+    title="Search Qlik catalog",
+    description=TOOL_DESCRIPTION,
+    input_model=SearchInput,
+    run=lambda ctx, params: handle_search(ctx.qlik_client, params),
+)

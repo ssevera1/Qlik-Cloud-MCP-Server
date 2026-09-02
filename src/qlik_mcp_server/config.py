@@ -101,6 +101,16 @@ class ServerConfig:
 _LEGACY_SERVER_KEYS = {"sse_host": "http_host", "sse_port": "http_port"}
 
 
+# Boolean switches from the four-tool era, kept for backward compatibility.
+_LEGACY_TOOL_FLAGS = {
+    "qlik_search": "search",
+    "qlik_get_fields": "get_fields",
+    "qlik_get_sheet_details": "get_sheet_details",
+    "qlik_get_hypercube_data": "get_hypercube_data",
+    "qlik_create_sheet": "create_sheet",
+}
+
+
 @dataclass
 class ToolSettings:
     get_sheet_details: bool = True
@@ -108,10 +118,20 @@ class ToolSettings:
     get_fields: bool = True
     create_sheet: bool = True
     search: bool = True
+    disabled_tools: list[str] = field(default_factory=list)
     max_hypercube_rows: int = 10000
     max_hypercube_columns: int = 50
     allow_sheet_creation: bool = True
     created_sheet_prefix: str = "[Agent] "
+
+    def is_enabled(self, tool_name: str) -> bool:
+        """Whether a tool should be registered (write gating is applied separately)."""
+        if tool_name in {name.strip() for name in self.disabled_tools}:
+            return False
+        flag = _LEGACY_TOOL_FLAGS.get(tool_name)
+        if flag is not None and not getattr(self, flag):
+            return False
+        return True
 
 
 @dataclass
@@ -150,6 +170,10 @@ class Config:
                 token_url=env.get("QLIK_OAUTH_TOKEN_URL", ""),
             )
 
+        if env.get("QLIK_MCP_DISABLED_TOOLS"):
+            config.tools.disabled_tools = [
+                name.strip() for name in env["QLIK_MCP_DISABLED_TOOLS"].split(",") if name.strip()
+            ]
         if env.get("QLIK_MCP_TRANSPORT"):
             config.server.transport = env["QLIK_MCP_TRANSPORT"]
         if env.get("QLIK_MCP_HTTP_PORT"):
@@ -186,8 +210,14 @@ class Config:
             })
 
         if "tools" in data and data["tools"]:
+            tools_data = dict(data["tools"])
+            disabled = tools_data.get("disabled_tools")
+            if isinstance(disabled, str):
+                tools_data["disabled_tools"] = [n.strip() for n in disabled.split(",") if n.strip()]
+            elif disabled is None:
+                tools_data.pop("disabled_tools", None)
             config.tools = ToolSettings(**{
-                k: v for k, v in data["tools"].items()
+                k: v for k, v in tools_data.items()
                 if k in ToolSettings.__dataclass_fields__
             })
 

@@ -144,3 +144,35 @@ class TestTransportConfig:
         config = Config.from_env()
         assert config.auth_mode == "oauth"
         assert config.validate() == []
+
+
+class TestToolEnablement:
+    def test_all_tools_enabled_by_default(self):
+        config = Config()
+        assert config.tools.is_enabled("qlik_search")
+        assert config.tools.is_enabled("qlik_list_bookmarks")
+
+    def test_legacy_boolean_disables_tool(self):
+        config = Config()
+        config.tools.create_sheet = False
+        assert not config.tools.is_enabled("qlik_create_sheet")
+        assert config.tools.is_enabled("qlik_add_chart")
+
+    def test_disabled_tools_list(self, tmp_path):
+        config_file = tmp_path / "c.yaml"
+        config_file.write_text(
+            "qlik:\n  tenant_url: https://t.qlikcloud.com\n  api_key: k\n"
+            "tools:\n  disabled_tools:\n    - qlik_add_filter\n    - qlik_search_field_values\n"
+        )
+        config = Config.load(config_file)
+        assert not config.tools.is_enabled("qlik_add_filter")
+        assert not config.tools.is_enabled("qlik_search_field_values")
+        assert config.tools.is_enabled("qlik_search")
+
+    def test_disabled_tools_from_env(self, monkeypatch):
+        monkeypatch.setenv("QLIK_TENANT_URL", "https://env.qlikcloud.com")
+        monkeypatch.setenv("QLIK_API_KEY", "k")
+        monkeypatch.setenv("QLIK_MCP_DISABLED_TOOLS", "qlik_add_chart, qlik_add_filter")
+        config = Config.from_env()
+        assert not config.tools.is_enabled("qlik_add_chart")
+        assert not config.tools.is_enabled("qlik_add_filter")

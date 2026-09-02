@@ -43,19 +43,18 @@ def _hypercube_ws(total_rows: int = 3, select_ok: bool = True) -> FakeWebSocket:
         if m == "CreateSessionObject":
             return {"qReturn": {"qHandle": 4}}
         if m == "GetLayout":
-            fetch = msg  # noqa: F841
-            return {"qHyperCube": {
+            return {"qLayout": {"qHyperCube": {
                 "qDimensionInfo": [{"qFallbackTitle": "Region"}],
                 "qMeasureInfo": [{"qFallbackTitle": "Sum(X)"}],
                 "qSize": {"qcx": 2, "qcy": total_rows},
                 "qDataPages": [{"qMatrix": [
                     [{"qText": "East"}, {"qText": "1", "qNum": 1}],
                 ]}],
-            }}
+            }}}
         if m == "GetHyperCubeData":
             page = msg["params"][1][0]
             n = page["qHeight"]
-            return [{"qMatrix": [[{"qText": f"R{page['qTop'] + i}"}, {"qNum": i}] for i in range(n)]}]
+            return {"qDataPages": [{"qMatrix": [[{"qText": f"R{page['qTop'] + i}"}, {"qNum": i}] for i in range(n)]}]}
         return {}
     return FakeWebSocket(responder)
 
@@ -108,10 +107,10 @@ class TestHypercubeHandler:
             if msg["method"] == "CreateSessionObject":
                 return {"qReturn": {"qHandle": 4}}
             if msg["method"] == "GetLayout":
-                return {"qHyperCube": {
+                return {"qLayout": {"qHyperCube": {
                     "qDimensionInfo": [{"qFallbackTitle": "Bad", "qError": {"qErrorCode": 7005}}],
                     "qMeasureInfo": [], "qSize": {"qcy": 0}, "qDataPages": [],
-                }}
+                }}}
             return {}
         result = await handle_get_hypercube_data(
             FakeEngineClient(FakeWebSocket(responder)),
