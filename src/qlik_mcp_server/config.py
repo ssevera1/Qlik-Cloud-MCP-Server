@@ -35,7 +35,7 @@ def _resolve_env_vars(value: str) -> str:
 
 def _resolve_dict(data: dict) -> dict:
     """Recursively resolve environment variables in a dictionary."""
-    resolved = {}
+    resolved: dict[str, Any] = {}
     for key, value in data.items():
         if isinstance(value, str):
             resolved[key] = _resolve_env_vars(value)

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import inspect
 import logging
-from typing import Annotated, Any, Awaitable, Callable, Optional
+from typing import Annotated, Any, Awaitable, Callable, Literal, Optional, cast
 
 from annotated_types import Ge, Gt, Le, Lt, MaxLen, MinLen
 from mcp.server import MCPServer
@@ -30,6 +30,9 @@ from .tools.spec import ToolContext, ToolSpec
 __all__ = ["TOOL_NAMES", "TOOL_SPECS", "create_server", "run_server", "transport_security_for"]
 
 logger = logging.getLogger(__name__)
+
+LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+_LOG_LEVELS: tuple[LogLevel, ...] = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 
 SERVER_INSTRUCTIONS = (
     "Tools for working with Qlik Cloud analytics apps. Typical flow: qlik_search to find an app "
@@ -104,7 +107,10 @@ def _make_tool_function(spec: ToolSpec, ctx: ToolContext) -> Callable[..., Await
     """
     parameters = []
     for name, model_field in spec.input_model.model_fields.items():
-        annotation = Annotated[model_field.annotation, _field_meta(model_field)]
+        # model_field.annotation is a runtime type object, not a literal type
+        # expression; mypy still tries to statically resolve it as one inside
+        # Annotated[...] and reports a spurious "Name is not defined".
+        annotation = Annotated[model_field.annotation, _field_meta(model_field)]  # type: ignore[name-defined]
         if model_field.is_required():
             default = inspect.Parameter.empty
         else:
@@ -137,13 +143,16 @@ def create_server(
         engine=engine_client or EngineClient(config, auth),
     )
 
-    level = config.server.log_level.upper()
+    log_level_choice = config.server.log_level.upper()
+    log_level: LogLevel = (
+        cast(LogLevel, log_level_choice) if log_level_choice in _LOG_LEVELS else "INFO"
+    )
     mcp = MCPServer(
         "qlik-cloud-mcp-server",
         title="Qlik Cloud MCP Server",
         instructions=SERVER_INSTRUCTIONS,
         version=__version__,
-        log_level=level if level in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL") else "INFO",
+        log_level=log_level,
     )
 
     read_only = ToolAnnotations(
