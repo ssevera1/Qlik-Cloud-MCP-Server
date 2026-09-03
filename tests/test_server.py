@@ -47,7 +47,7 @@ class TestToolRegistration:
         assert "qlik_create_sheet" not in names
 
     async def test_schemas_are_flat_with_descriptions(self):
-        tool = {t.name: t for t in await _server().list_tools()}["qlik_get_hypercube_data"]
+        tool = {t.name: t for t in await _server().list_tools()}["qlik_create_data_object"]
         props = tool.input_schema["properties"]
         assert set(props) >= {"app_id", "dimensions", "measures", "filters", "max_rows"}
         assert props["dimensions"]["description"]

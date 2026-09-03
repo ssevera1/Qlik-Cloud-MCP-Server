@@ -96,6 +96,7 @@ GET_FIELD_VALUES_SPEC = ToolSpec(
     description=GET_FIELD_VALUES_DESCRIPTION,
     input_model=GetFieldValuesInput,
     run=handle_get_field_values,
+    group="model",
 )
 
 SEARCH_FIELD_VALUES_SPEC = ToolSpec(
@@ -104,4 +105,5 @@ SEARCH_FIELD_VALUES_SPEC = ToolSpec(
     description=SEARCH_FIELD_VALUES_DESCRIPTION,
     input_model=SearchFieldValuesInput,
     run=handle_search_field_values,
+    group="model",
 )

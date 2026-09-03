@@ -66,3 +66,11 @@ Deliberately out of scope, and why:
 - **Automations, data products, datasets, glossaries, lineage, knowledge bases**: different REST APIs and different personas; Qlik's hosted server covers them.
 
 The registry (`tools/registry.py`) is the single place to add a tool: one `ToolSpec` with a Pydantic input model and a handler.
+
+## Update 2026-09-02 (evening): the full Qlik Cloud surface
+
+Version 0.4.0 implements 107 tools in 19 groups, covering every family on Qlik's hosted MCP tool page plus alerts, AutoML, reloads, spaces, and Qlik Answers. The one-capability-per-tool rule still holds; what changed is the answer to "how many": the catalog is now sized by configuration rather than by this document. `tools.profile` selects `full` (107), `analytics` (about 30, the app-analysis groups), or `readonly`; `tools.disabled_groups` and `tools.disabled_tools` trim further. The full list costs roughly 23k tokens of tool definitions, which is acceptable for Claude Code and Gemini Enterprise sessions that do platform work, and too much for a narrow analytics assistant, hence the profiles.
+
+Most REST-backed tools are declared as data (`tools/rest_tools.py`, `tools/rest_catalog.py`): one record with the method, path, parameters, and a result shaper. Endpoints and request shapes were taken from Qlik's generated `@qlik/api` client (v2.15.2) rather than from prose documentation.
+
+Official tools not implemented, because the public API has no equivalent: `qlik_get_automation_run_display` (covered by `qlik_get_automation_run_log`, the run's exported log), `qlik_start_automation_run_interactive` and `qlik_update_automation_run_input` (no public endpoint accepts input for a waiting run), `qlik_get_automation_connector_webhook_configuration` (connectors only expose a has-webhooks flag), and `qlik_search_connection_objects` (no public table-browsing endpoint for a data connection). `qlik_get_automation_inputs` is best effort: it reads input declarations out of the automation's workspace definition.

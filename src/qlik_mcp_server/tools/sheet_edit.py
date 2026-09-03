@@ -130,6 +130,7 @@ ADD_CHART_SPEC = ToolSpec(
     input_model=AddChartInput,
     run=handle_add_chart,
     writes=True,
+    group="build",
 )
 
 ADD_FILTER_SPEC = ToolSpec(
@@ -139,4 +140,5 @@ ADD_FILTER_SPEC = ToolSpec(
     input_model=AddFilterInput,
     run=handle_add_filter,
     writes=True,
+    group="build",
 )

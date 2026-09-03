@@ -1,25 +1,34 @@
 """Qlik Engine API client (WebSocket JSON-RPC).
 
 Connects to the Qlik Associative Engine (QIX) to read the data model,
-inspect and build sheets, and compute governed data.
+inspect and build sheets, manage master items and bookmarks, apply
+selections, and compute governed data.
 
 Wire format reference: https://qlik.dev/apis/json-rpc/qix/
 
-A note on result shapes: the raw JSON-RPC engine wraps every return value
-under its documented parameter name, for example ``{"qLayout": {...}}``
-for GetLayout and ``{"qDataPages": [...]}`` for GetHyperCubeData.
-Client libraries such as enigma.js unwrap these; this client must do it
-itself, which ``_unwrap`` handles while tolerating already-flat values.
+Result shapes: the raw JSON-RPC engine wraps every return value under its
+documented parameter name, for example ``{"qLayout": {...}}`` for GetLayout
+and ``{"qDataPages": [...]}`` for GetHyperCubeData. Client libraries such as
+enigma.js unwrap these; this client does it itself via ``_unwrap``.
+
+Sessions: ``EngineClient`` keeps one WebSocket per app open between tool
+calls (see ``qlik.reuse_sessions``). Calls to the same app are serialized on
+that socket; different apps run in parallel. Selections made with the
+selection tools persist on the app's session, while ``filters`` passed to
+data tools are applied in a temporary alternate state so they never leak.
 """
 
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import json
 import logging
 import math
 import re
 import time
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Optional
@@ -96,6 +105,7 @@ class HypercubeResult:
     rows: list[list[Any]] = field(default_factory=list)
     total_rows: int = 0
     truncated: bool = False
+    unmatched_filters: list[dict] = field(default_factory=list)
 
     def to_table(self) -> str:
         """Format as a readable text table."""
@@ -126,6 +136,29 @@ class HypercubeResult:
 
         return "\n".join(lines)
 
+    def to_markdown(self) -> str:
+        """Format as a GitHub-flavored markdown table."""
+        if not self.headers:
+            return "(no data)"
+
+        def esc(value: Any) -> str:
+            return str(value).replace("|", "\\|").replace("\n", " ")
+
+        lines = ["| " + " | ".join(esc(h) for h in self.headers) + " |",
+                 "|" + "|".join(" --- " for _ in self.headers) + "|"]
+        for row in self.rows:
+            lines.append("| " + " | ".join(esc(c) for c in row) + " |")
+        if self.truncated:
+            lines.append(f"\n(truncated: showing {len(self.rows)} of {self.total_rows} rows)")
+        return "\n".join(lines)
+
+    def to_csv(self) -> str:
+        buf = io.StringIO()
+        writer = csv.writer(buf, lineterminator="\n")
+        writer.writerow(self.headers)
+        writer.writerows(self.rows)
+        return buf.getvalue()
+
     def to_records(self) -> list[dict]:
         """Convert to list of dictionaries."""
         return [
@@ -133,16 +166,28 @@ class HypercubeResult:
             for row in self.rows
         ]
 
-    def as_payload(self) -> dict:
-        """The shape tools return to agents."""
-        return {
-            "headers": self.headers,
-            "data": self.rows,
+    def as_payload(self, fmt: str = "json") -> dict:
+        """The shape tools return to agents.
+
+        ``json`` (default) returns ``columns`` and ``rows`` (compact and
+        exact), ``markdown`` returns a table for display, ``csv`` returns
+        text ready to save.
+        """
+        payload: dict = {
             "row_count": len(self.rows),
             "total_rows": self.total_rows,
             "truncated": self.truncated,
-            "table": self.to_table(),
         }
+        if fmt == "markdown":
+            payload["table"] = self.to_markdown()
+        elif fmt == "csv":
+            payload["csv"] = self.to_csv()
+        else:
+            payload["columns"] = self.headers
+            payload["rows"] = self.rows
+        if self.unmatched_filters:
+            payload["filters_not_matched"] = self.unmatched_filters
+        return payload
 
 
 def _cell_value(cell: dict) -> Any:
@@ -169,6 +214,17 @@ def _frequency(text: Any) -> Optional[int]:
         return None
 
 
+def _generic_id(result: Any) -> str:
+    """Id of an object returned by a Create* call (qReturn.qGenericId or qInfo.qId)."""
+    result = result or {}
+    return ((result.get("qReturn") or {}).get("qGenericId")
+            or (result.get("qInfo") or {}).get("qId") or "")
+
+
+def _generic_handle(result: Any) -> Optional[int]:
+    return ((result or {}).get("qReturn") or {}).get("qHandle")
+
+
 class EngineSession:
     """A session connected to a specific Qlik app via the Engine API."""
 
@@ -177,6 +233,9 @@ class EngineSession:
         self._doc_handle = doc_handle
         self._app_id = app_id
         self._request_id = 0
+        self._temp_objects: list[str] = []
+        self._temp_states: list[str] = []
+        self.broken = False
 
     def _next_id(self) -> int:
         self._request_id += 1
@@ -190,6 +249,8 @@ class EngineSession:
         The engine interleaves id-less notifications (OnConnected, change
         lists, and so on) with responses. Those are skipped until the
         response carrying our request id arrives or the deadline passes.
+        Transport failures mark the session broken so a pooled socket is
+        not reused.
         """
         request_id = self._next_id()
         msg = {
@@ -200,18 +261,27 @@ class EngineSession:
             "params": params or [],
         }
 
-        await self._ws.send(json.dumps(msg))
+        try:
+            await self._ws.send(json.dumps(msg))
+        except Exception as e:  # noqa: BLE001 - any socket failure means the session is dead
+            self.broken = True
+            raise EngineError(f"Engine connection lost while sending {method}: {e}") from e
 
         deadline = time.monotonic() + _WS_REQUEST_DEADLINE
         while True:
             if time.monotonic() > deadline:
+                self.broken = True
                 raise EngineError(
                     f"Engine request {method} timed out after {_WS_REQUEST_DEADLINE}s"
                 )
             try:
                 raw = await asyncio.wait_for(self._ws.recv(), timeout=_WS_RECV_TIMEOUT)
             except TimeoutError as e:
+                self.broken = True
                 raise EngineError(f"Engine request timed out after {_WS_RECV_TIMEOUT}s") from e
+            except Exception as e:  # noqa: BLE001
+                self.broken = True
+                raise EngineError(f"Engine connection lost while waiting for {method}: {e}") from e
             try:
                 response = json.loads(raw)
             except json.JSONDecodeError:
@@ -225,7 +295,7 @@ class EngineSession:
                 raise EngineError(f"Engine error: {message}", code=err.get("code", -1))
             return response.get("result")
 
-    # ── Handles and layouts ───────────────────────────────────────
+    # ── Handles, layouts, temporary objects ───────────────────────
 
     async def _get_object_handle(self, object_id: str) -> int:
         result = await self._send("GetObject", self._doc_handle, [object_id])
@@ -233,6 +303,14 @@ class EngineSession:
         handle = ret.get("qHandle")
         if handle is None or handle < 0 or ret.get("qType") == "Null":
             raise EngineError(f"Object not found: {object_id}")
+        return handle
+
+    async def _get_field_handle(self, field_name: str, state: Optional[str] = None) -> int:
+        params: list = [field_name] if state is None else [field_name, state]
+        result = await self._send("GetField", self._doc_handle, params)
+        handle = _generic_handle(result)
+        if handle is None or handle < 0:
+            raise EngineError(f"Field not found: {field_name}")
         return handle
 
     async def _layout(self, handle: int) -> dict:
@@ -243,12 +321,48 @@ class EngineSession:
 
     async def _create_session_object(self, props: dict) -> int:
         result = await self._send("CreateSessionObject", self._doc_handle, [props])
-        handle = ((result or {}).get("qReturn") or {}).get("qHandle")
+        handle = _generic_handle(result)
         if handle is None:
             raise EngineError(
                 f"Failed to create session object of type {(props.get('qInfo') or {}).get('qType')}"
             )
+        obj_id = _generic_id(result)
+        if obj_id:
+            self._temp_objects.append(obj_id)
         return handle
+
+    async def _add_alternate_state(self) -> str:
+        name = f"mcp_{uuid.uuid4().hex[:8]}"
+        await self._send("AddAlternateState", self._doc_handle, [name])
+        self._temp_states.append(name)
+        return name
+
+    async def _remove_alternate_state(self, name: str) -> None:
+        try:
+            await self._send("RemoveAlternateState", self._doc_handle, [name])
+        except EngineError as e:
+            logger.debug("Could not remove alternate state %s: %s", name, e)
+        if name in self._temp_states:
+            self._temp_states.remove(name)
+
+    async def cleanup_temp(self) -> None:
+        """Destroy session objects and alternate states created during a tool call.
+
+        Only needed when the socket is kept open between calls; a closed
+        session takes its session objects with it.
+        """
+        if self.broken:
+            self._temp_objects.clear()
+            self._temp_states.clear()
+            return
+        for obj_id in list(self._temp_objects):
+            try:
+                await self._send("DestroySessionObject", self._doc_handle, [obj_id])
+            except EngineError as e:
+                logger.debug("Could not destroy session object %s: %s", obj_id, e)
+        self._temp_objects.clear()
+        for name in list(self._temp_states):
+            await self._remove_alternate_state(name)
 
     async def _save(self) -> None:
         await self._send("DoSave", self._doc_handle)
@@ -256,6 +370,12 @@ class EngineSession:
     async def get_app_layout(self) -> dict:
         """App-level layout: title, last reload time, file size, and so on."""
         return _unwrap(await self._send("GetAppLayout", self._doc_handle), "qLayout") or {}
+
+    async def get_script(self) -> str:
+        """The app's load script."""
+        result = await self._send("GetScript", self._doc_handle)
+        script = _unwrap(result, "qScript")
+        return script if isinstance(script, str) else ""
 
     # ── Sheets ────────────────────────────────────────────────────
 
@@ -410,7 +530,7 @@ class EngineSession:
         self, terms: list[str], fields: Optional[list[str]] = None, max_matches: int = 10
     ) -> dict:
         """Smart-search the data for terms, grouped by the fields where they match."""
-        options = {"qSearchFields": list(fields or []), "qContext": "Cleared"}
+        options = {"qSearchFields": list(fields or []), "qContext": "CurrentSelections"}
         page = {
             "qOffset": 0,
             "qCount": 100,
@@ -433,6 +553,80 @@ class EngineSession:
             "matches": matches,
             "total_groups": result.get("qTotalNumberOfGroups", len(matches)),
         }
+
+    # ── Selections ────────────────────────────────────────────────
+
+    async def apply_selections(
+        self, field_name: str, values: list[str], state: Optional[str] = None
+    ) -> bool:
+        """Select exact values in a field (optionally in an alternate state).
+
+        Returns the engine's success flag. False means none of the values
+        matched, in which case the selection was not applied.
+        """
+        field_handle = await self._get_field_handle(field_name, state)
+        select_values = [{"qText": v} for v in values]
+        result = await self._send("SelectValues", field_handle, [select_values, False, False])
+        return bool((result or {}).get("qReturn", False))
+
+    async def select_values(
+        self,
+        field_name: str,
+        values: Optional[list[str]] = None,
+        match: Optional[str] = None,
+        toggle: bool = False,
+    ) -> dict:
+        """Select values in the session's default state, by exact values or a search pattern.
+
+        ``match`` uses Qlik search syntax: wildcards (``Ea*``), numeric ranges
+        (``>100``), or plain text for a contains-match.
+        """
+        if not values and not match:
+            raise EngineError("Provide values or match to select")
+        field_handle = await self._get_field_handle(field_name)
+        if values:
+            result = await self._send(
+                "SelectValues", field_handle, [[{"qText": v} for v in values], toggle, False]
+            )
+            mode = "values"
+        else:
+            result = await self._send("Select", field_handle, [match, False, 0])
+            mode = "pattern"
+        applied = bool((result or {}).get("qReturn", False))
+        return {"field": field_name, "mode": mode, "applied": applied}
+
+    async def clear_selections(self, fields: Optional[list[str]] = None) -> dict:
+        """Clear all selections, or only the given fields."""
+        if not fields:
+            await self._send("ClearAll", self._doc_handle, [])
+            return {"cleared": "all"}
+        cleared = []
+        for name in fields:
+            field_handle = await self._get_field_handle(name)
+            await self._send("Clear", field_handle, [])
+            cleared.append(name)
+        return {"cleared": cleared}
+
+    async def get_current_selections(self) -> list[dict]:
+        """Selections active in the session's default state."""
+        handle = await self._create_session_object({
+            "qInfo": {"qType": "CurrentSelection"},
+            "qSelectionObjectDef": {},
+        })
+        layout = await self._layout(handle)
+        selections = []
+        for item in (layout.get("qSelectionObject") or {}).get("qSelections") or []:
+            names = [i.get("qName", "") for i in item.get("qSelectedFieldSelectionInfo") or []]
+            if not names and item.get("qSelected"):
+                names = [v.strip() for v in str(item["qSelected"]).split(", ") if v.strip()]
+            selections.append({
+                "field": item.get("qField", ""),
+                "selected": names,
+                "selected_count": item.get("qSelectedCount", len(names)),
+                "total": item.get("qTotal", 0),
+                "locked": bool(item.get("qLocked", False)),
+            })
+        return selections
 
     # ── Master items and bookmarks ────────────────────────────────
 
@@ -493,6 +687,141 @@ class EngineSession:
 
         return {"dimensions": dimensions, "measures": measures}
 
+    async def create_dimension(
+        self,
+        title: str,
+        field_defs: list[str],
+        label: Optional[str] = None,
+        description: str = "",
+        tags: Optional[list[str]] = None,
+        grouping: str = "N",
+    ) -> dict:
+        """Create a master dimension and save the app."""
+        props = {
+            "qInfo": {"qType": "dimension"},
+            "qDim": {
+                "qGrouping": grouping,
+                "qFieldDefs": list(field_defs),
+                "qFieldLabels": [label or ""] * len(field_defs),
+                "title": title,
+                "qLabelExpression": "",
+            },
+            "qMetaDef": {"title": title, "description": description, "tags": list(tags or [])},
+        }
+        result = await self._send("CreateDimension", self._doc_handle, [props])
+        new_id = _generic_id(result)
+        if not new_id:
+            raise EngineError("Engine returned no id for the new dimension")
+        await self._save()
+        return {"id": new_id, "title": title, "field_defs": list(field_defs), "saved": True}
+
+    async def create_measure(
+        self,
+        title: str,
+        expression: str,
+        label: Optional[str] = None,
+        description: str = "",
+        tags: Optional[list[str]] = None,
+    ) -> dict:
+        """Create a master measure and save the app."""
+        props = {
+            "qInfo": {"qType": "measure"},
+            "qMeasure": {
+                "qLabel": label or title,
+                "qDef": expression,
+                "qGrouping": "N",
+                "qExpressions": [],
+                "qActiveExpression": 0,
+                "qLabelExpression": "",
+            },
+            "qMetaDef": {"title": title, "description": description, "tags": list(tags or [])},
+        }
+        result = await self._send("CreateMeasure", self._doc_handle, [props])
+        new_id = _generic_id(result)
+        if not new_id:
+            raise EngineError("Engine returned no id for the new measure")
+        await self._save()
+        return {"id": new_id, "title": title, "expression": expression, "saved": True}
+
+    async def _update_master_item(self, getter: str, item_id: str, mutate) -> dict:
+        result = await self._send(getter, self._doc_handle, [item_id])
+        handle = _generic_handle(result)
+        if handle is None or handle < 0:
+            raise EngineError(f"Master item not found: {item_id}")
+        props = await self._properties(handle)
+        if not props:
+            raise EngineError(f"Master item has no properties: {item_id}")
+        mutate(props)
+        await self._send("SetProperties", handle, [props])
+        await self._save()
+        return {"id": item_id, "saved": True}
+
+    async def update_dimension(
+        self,
+        dimension_id: str,
+        title: Optional[str] = None,
+        field_defs: Optional[list[str]] = None,
+        label: Optional[str] = None,
+        description: Optional[str] = None,
+        tags: Optional[list[str]] = None,
+    ) -> dict:
+        def mutate(props: dict) -> None:
+            dim = props.setdefault("qDim", {})
+            meta = props.setdefault("qMetaDef", {})
+            if field_defs is not None:
+                dim["qFieldDefs"] = list(field_defs)
+                dim["qFieldLabels"] = [label or ""] * len(field_defs)
+            elif label is not None:
+                dim["qFieldLabels"] = [label] * max(1, len(dim.get("qFieldDefs") or [1]))
+            if title is not None:
+                dim["title"] = title
+                meta["title"] = title
+            if description is not None:
+                meta["description"] = description
+            if tags is not None:
+                meta["tags"] = list(tags)
+
+        return await self._update_master_item("GetDimension", dimension_id, mutate)
+
+    async def update_measure(
+        self,
+        measure_id: str,
+        title: Optional[str] = None,
+        expression: Optional[str] = None,
+        label: Optional[str] = None,
+        description: Optional[str] = None,
+        tags: Optional[list[str]] = None,
+    ) -> dict:
+        def mutate(props: dict) -> None:
+            measure = props.setdefault("qMeasure", {})
+            meta = props.setdefault("qMetaDef", {})
+            if expression is not None:
+                measure["qDef"] = expression
+            if label is not None:
+                measure["qLabel"] = label
+            if title is not None:
+                meta["title"] = title
+            if description is not None:
+                meta["description"] = description
+            if tags is not None:
+                meta["tags"] = list(tags)
+
+        return await self._update_master_item("GetMeasure", measure_id, mutate)
+
+    async def delete_dimension(self, dimension_id: str) -> bool:
+        result = await self._send("DestroyDimension", self._doc_handle, [dimension_id])
+        ok = bool((result or {}).get("qSuccess", False))
+        if ok:
+            await self._save()
+        return ok
+
+    async def delete_measure(self, measure_id: str) -> bool:
+        result = await self._send("DestroyMeasure", self._doc_handle, [measure_id])
+        ok = bool((result or {}).get("qSuccess", False))
+        if ok:
+            await self._save()
+        return ok
+
     async def get_bookmarks(self) -> list[dict]:
         """Bookmarks stored in the app."""
         handle = await self._create_session_object({
@@ -528,6 +857,29 @@ class EngineSession:
         """Apply a bookmark's selections to this session. Returns the engine's success flag."""
         result = await self._send("ApplyBookmark", self._doc_handle, [bookmark_id])
         return bool((result or {}).get("qSuccess", False))
+
+    async def create_bookmark(self, title: str, description: str = "", sheet_id: str = "") -> dict:
+        """Save the session's current selections as a bookmark and save the app."""
+        props: dict = {
+            "qInfo": {"qType": "bookmark"},
+            "qMetaDef": {"title": title, "description": description},
+            "creationDate": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        if sheet_id:
+            props["sheetId"] = sheet_id
+        result = await self._send("CreateBookmark", self._doc_handle, [props])
+        new_id = _generic_id(result)
+        if not new_id:
+            raise EngineError("Engine returned no id for the new bookmark")
+        await self._save()
+        return {"bookmark_id": new_id, "title": title, "saved": True}
+
+    async def delete_bookmark(self, bookmark_id: str) -> bool:
+        result = await self._send("DestroyBookmark", self._doc_handle, [bookmark_id])
+        ok = bool((result or {}).get("qSuccess", False))
+        if ok:
+            await self._save()
+        return ok
 
     # ── Charts (existing objects) ─────────────────────────────────
 
@@ -609,7 +961,7 @@ class EngineSession:
             if hc.get("qMode") in ("P", "K", "T"):
                 raise EngineError(
                     "Pivot and stacked charts are not readable directly; call "
-                    "qlik_get_hypercube_data with the chart's dimensions and measures instead"
+                    "qlik_create_data_object with the chart's dimensions and measures instead"
                 )
             return await self._read_hypercube(hc, handle, max_rows=max_rows, page_size=page_size)
 
@@ -690,6 +1042,9 @@ class EngineSession:
         measures: list[str],
         page_size: int = 1000,
         max_rows: int = 10000,
+        filters: Optional[list[dict]] = None,
+        sort_by: Optional[str] = None,
+        sort_descending: bool = False,
     ) -> HypercubeResult:
         """Create a session hypercube and fetch its data.
 
@@ -698,67 +1053,77 @@ class EngineSession:
             measures: Expressions for measures (e.g., "Sum(Revenue)").
             page_size: Rows per page for data fetching.
             max_rows: Maximum total rows to retrieve.
+            filters: ``[{"field": ..., "values": [...]}, ...]`` applied in a
+                temporary alternate state, so they never touch the session's
+                own selections. Unmatched filters are reported on the result.
+            sort_by: Column (dimension or measure label) to sort by; default is
+                load order for dimensions.
+            sort_descending: Sort direction when ``sort_by`` is set.
         """
-        q_dimensions = [
-            {
-                "qDef": {
-                    "qFieldDefs": [dim],
-                    "qSortCriterias": [{"qSortByLoadOrder": 1}],
-                },
-            }
-            for dim in dimensions
-        ]
-        q_measures = [
-            {"qDef": {"qDef": measure, "qLabel": measure}} for measure in measures
-        ]
+        state: Optional[str] = None
+        unmatched: list[dict] = []
+        try:
+            if filters:
+                state = await self._add_alternate_state()
+                for f in filters:
+                    values = list(f.get("values") or [])
+                    ok = await self.apply_selections(f["field"], values, state=state)
+                    if not ok:
+                        unmatched.append({"field": f["field"], "values": values})
 
-        width = max(1, len(dimensions) + len(measures))
-        initial_fetch = max(1, min(page_size, max_rows, _MAX_PAGE_CELLS // width))
+            sort_dir = -1 if sort_descending else 1
+            q_dimensions = []
+            for dim in dimensions:
+                criteria = {"qSortByLoadOrder": 1}
+                if sort_by and sort_by == dim:
+                    criteria = {"qSortByAscii": sort_dir, "qSortByNumeric": sort_dir, "qSortByLoadOrder": 0}
+                q_dimensions.append({
+                    "qDef": {"qFieldDefs": [dim], "qSortCriterias": [criteria]},
+                })
+            q_measures = []
+            for measure in measures:
+                entry: dict = {"qDef": {"qDef": measure, "qLabel": measure}}
+                if sort_by and sort_by == measure:
+                    entry["qSortBy"] = {"qSortByNumeric": sort_dir}
+                q_measures.append(entry)
 
-        handle = await self._create_session_object({
-            "qInfo": {"qType": "hypercube"},
-            "qHyperCubeDef": {
+            columns = list(dimensions) + list(measures)
+            inter_column_sort = list(range(len(columns)))
+            if sort_by and sort_by in columns:
+                idx = columns.index(sort_by)
+                inter_column_sort = [idx] + [i for i in inter_column_sort if i != idx]
+
+            width = max(1, len(columns))
+            initial_fetch = max(1, min(page_size, max_rows, _MAX_PAGE_CELLS // width))
+
+            hc_def: dict = {
                 "qDimensions": q_dimensions,
                 "qMeasures": q_measures,
+                "qInterColumnSortOrder": inter_column_sort,
                 "qInitialDataFetch": [
                     {"qTop": 0, "qLeft": 0, "qHeight": initial_fetch, "qWidth": width}
                 ],
-            },
-        })
+            }
+            if state:
+                hc_def["qStateName"] = state
 
-        layout = await self._layout(handle)
-        if not layout:
-            raise EngineError("Empty layout from hypercube")
+            handle = await self._create_session_object({
+                "qInfo": {"qType": "hypercube"},
+                "qHyperCubeDef": hc_def,
+            })
 
-        return await self._read_hypercube(
-            layout.get("qHyperCube") or {}, handle, max_rows=max_rows, page_size=page_size,
-        )
+            layout = await self._layout(handle)
+            if not layout:
+                raise EngineError("Empty layout from hypercube")
 
-    # ── Selections ────────────────────────────────────────────────
-
-    async def apply_selections(self, field_name: str, values: list[str]) -> bool:
-        """Apply a selection (filter) on a field.
-
-        Returns the engine's success flag. False means none of the values
-        matched, in which case the selection was not applied.
-        """
-        result = await self._send("GetField", self._doc_handle, [field_name])
-        if not result:
-            raise EngineError(f"Field not found: {field_name}")
-
-        field_handle = (result.get("qReturn") or {}).get("qHandle")
-        if field_handle is None:
-            raise EngineError(f"No handle for field: {field_name}")
-
-        select_values = [{"qText": v} for v in values]
-        result = await self._send("SelectValues", field_handle, [
-            select_values, False, False
-        ])
-        return bool((result or {}).get("qReturn", False))
-
-    async def clear_selections(self) -> None:
-        """Clear all selections in the app."""
-        await self._send("ClearAll", self._doc_handle, [])
+            result = await self._read_hypercube(
+                layout.get("qHyperCube") or {}, handle, max_rows=max_rows, page_size=page_size,
+            )
+            result.unmatched_filters = unmatched
+            return result
+        finally:
+            if state and not self.broken:
+                await self._remove_alternate_state(state)
 
     # ── Sheet creation and editing ────────────────────────────────
 
@@ -771,8 +1136,7 @@ class EngineSession:
             try:
                 child_props = self._build_child_props(obj_def)
                 child = await self._send("CreateChild", parent_handle, [child_props])
-                child_ret = (child or {}).get("qReturn") or {}
-                child_id = child_ret.get("qGenericId") or ((child or {}).get("qInfo") or {}).get("qId")
+                child_id = _generic_id(child)
                 if not child_id:
                     raise EngineError("Engine returned no id for child object")
                 created.append({
@@ -815,9 +1179,8 @@ class EngineSession:
         if not result:
             raise EngineError("Failed to create sheet")
 
-        q_return = result.get("qReturn") or {}
-        sheet_handle = q_return.get("qHandle")
-        sheet_id = q_return.get("qGenericId") or (result.get("qInfo") or {}).get("qId", "")
+        sheet_handle = _generic_handle(result)
+        sheet_id = _generic_id(result)
 
         created: list[dict] = []
         failed: list[str] = []
@@ -885,9 +1248,8 @@ class EngineSession:
             "qChildListDef": {"qData": {"title": "/title", "visualization": "/visualization"}},
         }
         pane = await self._send("CreateChild", sheet_handle, [pane_props])
-        pane_ret = (pane or {}).get("qReturn") or {}
-        pane_handle = pane_ret.get("qHandle")
-        pane_id = pane_ret.get("qGenericId") or ((pane or {}).get("qInfo") or {}).get("qId")
+        pane_handle = _generic_handle(pane)
+        pane_id = _generic_id(pane)
         if pane_handle is None or not pane_id:
             raise EngineError("Failed to create filter pane")
 
@@ -908,10 +1270,7 @@ class EngineSession:
                 },
             }
             child = await self._send("CreateChild", pane_handle, [listbox_props])
-            child_ret = (child or {}).get("qReturn") or {}
-            listbox_ids.append(
-                child_ret.get("qGenericId") or ((child or {}).get("qInfo") or {}).get("qId") or ""
-            )
+            listbox_ids.append(_generic_id(child))
 
         await self._place_on_sheet(sheet_handle, [{"id": pane_id, "type": "filterpane", "title": title}])
         await self._save()
@@ -1033,29 +1392,34 @@ class EngineSession:
         }
 
 
+@dataclass
+class _PooledSession:
+    session: Optional[EngineSession]
+    lock: asyncio.Lock
+    last_used: float
+
+
 class EngineClient:
-    """Factory for Engine API sessions."""
+    """Factory and pool for Engine API sessions.
+
+    With ``qlik.reuse_sessions`` (default) one socket per app is kept open
+    for ``qlik.session_idle_seconds`` after its last use, which removes the
+    connect and OpenDoc round trips from every subsequent call. Calls to the
+    same app are serialized on that socket; different apps run in parallel.
+    """
 
     def __init__(self, config: Config, auth: AuthManager) -> None:
         self.config = config
         self.auth = auth
+        self._pool: dict[str, _PooledSession] = {}
+        self._pool_lock = asyncio.Lock()
 
-    @asynccontextmanager
-    async def open_app(self, app_id: str) -> AsyncIterator[EngineSession]:
-        """Open a WebSocket connection to a Qlik app.
-
-        Usage:
-            async with engine_client.open_app("app-id") as session:
-                sheets = await session.get_sheets()
-        """
-        _validate_id(app_id, "app_id")
-
+    async def _connect(self, app_id: str) -> EngineSession:
         tenant_host = self.config.tenant_host
         ws_url = f"wss://{tenant_host}/app/{app_id}"
         headers = await self.auth.get_ws_headers()
 
         logger.debug("Connecting to Engine API: %s", ws_url)
-
         try:
             ws = await ws_connect(
                 ws_url,
@@ -1073,13 +1437,113 @@ class EngineClient:
             result = await session._send("OpenDoc", -1, [app_id])
             if not result:
                 raise EngineError(f"Failed to open document: {app_id}")
-            doc_handle = (result.get("qReturn") or {}).get("qHandle")
+            doc_handle = _generic_handle(result)
             if doc_handle is None:
                 raise EngineError(f"No document handle returned for: {app_id}")
             session._doc_handle = doc_handle
-
-            logger.debug("Engine session opened for app %s (handle=%d)", app_id, doc_handle)
-            yield session
-        finally:
+        except BaseException:
             await session.close()
-            logger.debug("Engine session closed for app %s", app_id)
+            raise
+        logger.debug("Engine session opened for app %s (handle=%d)", app_id, session._doc_handle)
+        return session
+
+    @asynccontextmanager
+    async def open_app(self, app_id: str) -> AsyncIterator[EngineSession]:
+        """Open (or reuse) a WebSocket session to a Qlik app.
+
+        Usage:
+            async with engine_client.open_app("app-id") as session:
+                sheets = await session.get_sheets()
+        """
+        _validate_id(app_id, "app_id")
+
+        if not self.config.qlik.reuse_sessions:
+            session = await self._connect(app_id)
+            try:
+                yield session
+            finally:
+                await session.close()
+                logger.debug("Engine session closed for app %s", app_id)
+            return
+
+        entry = await self._acquire(app_id)
+        try:
+            if entry.session is None:
+                entry.session = await self._connect(app_id)
+            yield entry.session
+        except BaseException:
+            if entry.session is not None and entry.session.broken:
+                await self._evict(app_id, entry)
+            raise
+        finally:
+            if entry.session is not None:
+                if entry.session.broken:
+                    await self._evict(app_id, entry)
+                else:
+                    try:
+                        await entry.session.cleanup_temp()
+                    except EngineError:
+                        await self._evict(app_id, entry)
+            elif app_id in self._pool and self._pool[app_id] is entry:
+                del self._pool[app_id]
+            entry.last_used = time.monotonic()
+            entry.lock.release()
+            await self._evict_idle()
+
+    async def _acquire(self, app_id: str) -> _PooledSession:
+        async with self._pool_lock:
+            entry = self._pool.get(app_id)
+            if entry is None:
+                entry = _PooledSession(session=None, lock=asyncio.Lock(), last_used=time.monotonic())
+                self._pool[app_id] = entry
+        await entry.lock.acquire()
+        # Re-check under the lock: the entry may have expired while we waited.
+        if entry.session is not None and self._expired(entry):
+            await entry.session.close()
+            entry.session = None
+        if self._pool.get(app_id) is not entry:
+            # Evicted while waiting; register again.
+            async with self._pool_lock:
+                self._pool[app_id] = entry
+        return entry
+
+    def _expired(self, entry: _PooledSession) -> bool:
+        return time.monotonic() - entry.last_used > self.config.qlik.session_idle_seconds
+
+    async def _evict(self, app_id: str, entry: _PooledSession) -> None:
+        if entry.session is not None:
+            await entry.session.close()
+            entry.session = None
+        if self._pool.get(app_id) is entry:
+            del self._pool[app_id]
+
+    async def _evict_idle(self) -> None:
+        """Close idle sessions and enforce the pool size limit."""
+        async with self._pool_lock:
+            victims = [
+                (app_id, entry) for app_id, entry in self._pool.items()
+                if not entry.lock.locked() and (entry.session is None or self._expired(entry))
+            ]
+            for app_id, _ in victims:
+                del self._pool[app_id]
+            overflow = len(self._pool) - self.config.qlik.max_sessions
+            if overflow > 0:
+                idle = sorted(
+                    ((app_id, entry) for app_id, entry in self._pool.items() if not entry.lock.locked()),
+                    key=lambda item: item[1].last_used,
+                )
+                for app_id, entry in idle[:overflow]:
+                    victims.append((app_id, entry))
+                    del self._pool[app_id]
+        for _, entry in victims:
+            if entry.session is not None:
+                await entry.session.close()
+
+    async def close(self) -> None:
+        """Close every pooled session."""
+        async with self._pool_lock:
+            entries = list(self._pool.values())
+            self._pool.clear()
+        for entry in entries:
+            if entry.session is not None:
+                await entry.session.close()

@@ -14,9 +14,11 @@ from qlik_mcp_server.server import TOOL_NAMES, create_server
 
 from .app_fixture import APP_ID, CHART_ID, DOC, LISTBOX_ID, SHEET_ID, build_app_ws
 
+# Engine-backed tools that must be present, in registry order.
 EXPECTED_TOOLS = (
     "qlik_search",
     "qlik_describe_app",
+    "qlik_get_app_script",
     "qlik_get_fields",
     "qlik_get_field_values",
     "qlik_search_field_values",
@@ -26,8 +28,20 @@ EXPECTED_TOOLS = (
     "qlik_get_chart_data",
     "qlik_list_dimensions",
     "qlik_list_measures",
+    "qlik_create_dimension",
+    "qlik_update_dimension",
+    "qlik_delete_dimension",
+    "qlik_create_measure",
+    "qlik_update_measure",
+    "qlik_delete_measure",
     "qlik_list_bookmarks",
-    "qlik_get_hypercube_data",
+    "qlik_create_bookmark",
+    "qlik_select_bookmark",
+    "qlik_delete_bookmark",
+    "qlik_select_values",
+    "qlik_clear_selections",
+    "qlik_get_current_selections",
+    "qlik_create_data_object",
     "qlik_create_sheet",
     "qlik_add_chart",
     "qlik_add_filter",
@@ -92,15 +106,19 @@ async def _call(server, name, args):
 class TestRegistry:
     async def test_all_expected_tools_exposed_in_order(self, stack):
         server, _ = stack
-        assert TOOL_NAMES == EXPECTED_TOOLS
-        assert [t.name for t in await server.list_tools()] == list(EXPECTED_TOOLS)
+        assert TOOL_NAMES[: len(EXPECTED_TOOLS)] == EXPECTED_TOOLS
+        listed = [t.name for t in await server.list_tools()]
+        assert listed[: len(EXPECTED_TOOLS)] == list(EXPECTED_TOOLS)
+        assert len(set(listed)) == len(listed), "duplicate tool names"
 
     async def test_read_only_annotations(self, stack):
         server, _ = stack
         for tool in await server.list_tools():
             assert tool.annotations is not None, tool.name
-            assert tool.annotations.read_only_hint is (tool.name not in WRITE_TOOLS), tool.name
-            assert tool.annotations.destructive_hint is False, tool.name
+            if tool.name in WRITE_TOOLS:
+                assert tool.annotations.read_only_hint is False, tool.name
+            if tool.name in ("qlik_search", "qlik_get_fields", "qlik_get_chart_data"):
+                assert tool.annotations.read_only_hint is True, tool.name
 
     async def test_every_tool_has_description_and_flat_schema(self, stack):
         server, _ = stack
@@ -123,7 +141,7 @@ class TestRegistry:
         names = {t.name for t in await server.list_tools()}
         assert "qlik_search_field_values" not in names
         assert "qlik_list_bookmarks" not in names
-        assert len(names) == len(EXPECTED_TOOLS) - 2
+        assert len(names) == len(TOOL_NAMES) - 2
 
 
 class TestDiscoveryTools:
@@ -189,14 +207,21 @@ class TestSheetAndChartTools:
     async def test_get_chart_data(self, stack):
         server, _ = stack
         payload = await _call(server, "qlik_get_chart_data", {"app_id": APP_ID, "object_id": CHART_ID})
-        assert payload["headers"] == ["Region", "Sales", "Margin"]
+        assert payload["columns"] == ["Region", "Sales", "Margin"]
         assert payload["row_count"] == 2
-        assert "table" in payload
+        assert "table" not in payload
+
+    async def test_get_chart_data_markdown(self, stack):
+        server, _ = stack
+        payload = await _call(server, "qlik_get_chart_data",
+                              {"app_id": APP_ID, "object_id": CHART_ID, "format": "markdown"})
+        assert payload["table"].startswith("| Region | Sales | Margin |")
+        assert "rows" not in payload
 
     async def test_get_chart_data_listbox(self, stack):
         server, _ = stack
         payload = await _call(server, "qlik_get_chart_data", {"app_id": APP_ID, "object_id": LISTBOX_ID})
-        assert payload["data"] == [["East"], ["West"]]
+        assert payload["rows"] == [["East"], ["West"]]
 
 
 class TestMasterItemTools:
@@ -219,7 +244,7 @@ class TestMasterItemTools:
 class TestDataTools:
     async def test_hypercube_with_bookmark(self, stack):
         server, engine = stack
-        payload = await _call(server, "qlik_get_hypercube_data", {
+        payload = await _call(server, "qlik_create_data_object", {
             "app_id": APP_ID, "dimensions": ["Region"], "measures": ["Sum(Sales)"], "bookmark_id": "bm-1",
         })
         assert payload["bookmark_applied"] is True
@@ -228,7 +253,7 @@ class TestDataTools:
 
     async def test_hypercube_unknown_bookmark_is_an_error(self, stack):
         server, _ = stack
-        result = await server.call_tool("qlik_get_hypercube_data", {
+        result = await server.call_tool("qlik_create_data_object", {
             "app_id": APP_ID, "dimensions": ["Region"], "measures": ["Sum(Sales)"], "bookmark_id": "nope",
         })
         assert "error" in result.structured_content

@@ -74,4 +74,5 @@ GET_SHEET_DETAILS_SPEC = ToolSpec(
     description=TOOL_DESCRIPTION,
     input_model=GetSheetDetailsInput,
     run=lambda ctx, params: handle_get_sheet_details(ctx.engine, params),
+    group="dashboards",
 )

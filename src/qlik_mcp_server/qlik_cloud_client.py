@@ -1,7 +1,7 @@
 """Qlik Cloud REST API client.
 
-Handles catalog search, app metadata, and space listing via the
-Qlik Cloud REST API. Reference: https://qlik.dev/apis/rest/items/
+Handles catalog search, app metadata, and the generic ``call`` used by the
+declarative REST tools. Reference: https://qlik.dev/apis/rest/
 """
 
 from __future__ import annotations
@@ -10,7 +10,9 @@ import asyncio
 import json
 import logging
 import re
+import time
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import httpx
 
@@ -38,8 +40,16 @@ class QlikCloudError(Exception):
         self.status_code = status_code
 
 
+def json_dumps_stable(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, default=str)
+
+
 class QlikCloudClient:
-    """Async client for the Qlik Cloud REST API."""
+    """Async client for the Qlik Cloud REST API.
+
+    One pooled HTTP client is kept for the life of the server, and read-only
+    metadata calls that opt in are cached for ``qlik.cache_ttl_seconds``.
+    """
 
     def __init__(
         self,
@@ -52,6 +62,7 @@ class QlikCloudClient:
         self.base_url = config.qlik.tenant_url.rstrip("/")
         self._transport = transport
         self._client: Optional[httpx.AsyncClient] = None
+        self._cache: dict[tuple[str, str], tuple[float, Any]] = {}
 
     async def _ensure_client(self) -> httpx.AsyncClient:
         """Get or create the HTTP client."""
@@ -60,6 +71,7 @@ class QlikCloudClient:
                 timeout=self.config.qlik.timeout_seconds,
                 follow_redirects=True,
                 transport=self._transport,
+                limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
             )
         return self._client
 
@@ -135,6 +147,57 @@ class QlikCloudClient:
 
         raise QlikCloudError("Max retries exceeded")
 
+    async def call(
+        self,
+        method: str,
+        path: str,
+        params: Optional[dict] = None,
+        json: Optional[Any] = None,
+        text: bool = False,
+        cache: bool = False,
+    ) -> Any:
+        """Generic authenticated call used by the declarative REST tools.
+
+        ``text`` returns the body as a string (for markdown or log exports).
+        ``cache`` serves repeated GETs from memory for ``qlik.cache_ttl_seconds``.
+        """
+        ttl = self.config.qlik.cache_ttl_seconds
+        cache_key: Optional[tuple[str, str]] = None
+        if cache and method.upper() == "GET" and ttl > 0:
+            cache_key = (path, json_dumps_stable(params))
+            hit = self._cache.get(cache_key)
+            if hit is not None and hit[0] > time.monotonic():
+                return hit[1]
+
+        raw = await self._request(method.upper(), path, params=params, json_data=json)
+        if text:
+            if isinstance(raw, dict) and set(raw) == {"raw_content"}:
+                raw = raw["raw_content"]
+            elif not isinstance(raw, str):
+                raw = json_dumps_stable(raw)
+
+        if cache_key is not None:
+            if len(self._cache) > 512:
+                self._cache.clear()
+            self._cache[cache_key] = (time.monotonic() + ttl, raw)
+        return raw
+
+    async def fetch_text_url(self, url: str, max_chars: int = 20000) -> str:
+        """Download a plain-text resource from an https URL returned by the API (no credentials sent)."""
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or not parsed.hostname:
+            raise QlikCloudError("Refusing to download from a non-https URL")
+        try:
+            async with httpx.AsyncClient(
+                timeout=self.config.qlik.timeout_seconds, follow_redirects=True, transport=self._transport,
+            ) as client:
+                response = await client.get(url)
+        except httpx.HTTPError as e:
+            raise QlikCloudError("Could not download the exported file") from e
+        if response.status_code >= 400:
+            raise QlikCloudError(f"Download failed (HTTP {response.status_code})", status_code=response.status_code)
+        return response.text[:max_chars]
+
     def _open_url(self, item: dict) -> str:
         """Best-effort link to open an item in the Qlik Cloud hub."""
         href = ((item.get("links") or {}).get("open") or {}).get("href")
@@ -192,7 +255,7 @@ class QlikCloudClient:
         """Get metadata for a specific app."""
         if not _UUID_RE.fullmatch(app_id):
             raise QlikCloudError("Invalid app_id: expected UUID format")
-        result = await self._request("GET", f"/api/v1/apps/{app_id}")
+        result = await self.call("GET", f"/api/v1/apps/{app_id}", cache=True)
         if not result:
             raise QlikCloudError(f"App not found: {app_id}", status_code=404)
         return result.get("attributes", result)
@@ -201,7 +264,7 @@ class QlikCloudClient:
         """Data model metadata for an app: fields, tables, reload statistics."""
         if not _UUID_RE.fullmatch(app_id):
             raise QlikCloudError("Invalid app_id: expected UUID format")
-        result = await self._request("GET", f"/api/v1/apps/{app_id}/data/metadata")
+        result = await self.call("GET", f"/api/v1/apps/{app_id}/data/metadata", cache=True)
         return result if isinstance(result, dict) else {}
 
     async def list_apps(

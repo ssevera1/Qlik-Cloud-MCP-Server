@@ -163,4 +163,5 @@ CREATE_SHEET_SPEC = ToolSpec(
         allow_creation=ctx.config.tools.allow_sheet_creation,
     ),
     writes=True,
+    group="build",
 )

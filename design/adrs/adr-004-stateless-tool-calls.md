@@ -39,3 +39,7 @@ Two approaches for the MCP server:
 - No session pool or connection cache in the server
 - The `qlik_get_hypercube_data` tool accepts an optional `filters` parameter for selections within a single call, and reports any filter the engine could not match in `filters_not_matched`
 - `qlik_create_sheet` saves the app (`DoSave`) inside the same call, since nothing survives the session otherwise
+
+## Update 2026-09-02: sessions are reused, calls stay self-contained
+
+Version 0.4.0 keeps one Engine WebSocket per app open between calls (`qlik.reuse_sessions`, see ADR-006) because the connect and `OpenDoc` round trips were most of each call's latency. The property this ADR protects, that a data call is self-contained, is kept differently: per-call `filters` on `qlik_create_data_object` are applied in a temporary alternate state that is removed afterwards, and temporary session objects are destroyed after every call. What changed is that the server now also offers explicit session state on purpose: `qlik_select_values`, `qlik_clear_selections`, `qlik_get_current_selections`, and `qlik_select_bookmark` act on the app's live session, the way Qlik's own hosted MCP server works, so an agent can explore interactively. Data tools report that state so it is never invisible. Setting `qlik.reuse_sessions: false` restores one connection per call.

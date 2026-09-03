@@ -17,6 +17,15 @@ logger = logging.getLogger(__name__)
 _ENV_VAR_PATTERN = re.compile(r"\$\{([^}]+)\}")
 
 VALID_TRANSPORTS = ("stdio", "streamable-http", "sse")
+VALID_PROFILES = ("full", "analytics", "readonly")
+
+# Tool groups included by the "analytics" profile: everything needed to
+# understand, query, and build in analytics apps, without the platform
+# (automations, governance, pipelines, ML, admin) surface.
+ANALYTICS_GROUPS = frozenset({
+    "discover", "model", "dashboards", "master_items", "bookmarks", "selections",
+    "compute", "build", "answers", "lineage",
+})
 
 
 def _resolve_env_vars(value: str) -> str:
@@ -71,6 +80,14 @@ def _tenant_url_errors(url: str) -> list[str]:
     return []
 
 
+def _truthy(value: str) -> bool:
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _csv(value: str) -> list[str]:
+    return [name.strip() for name in value.split(",") if name.strip()]
+
+
 @dataclass
 class OAuthConfig:
     client_id: str = ""
@@ -86,6 +103,12 @@ class QlikConfig:
     default_app_id: str = ""
     timeout_seconds: int = 30
     max_retries: int = 3
+    # Keep one Engine WebSocket per app open between calls (see engine_client).
+    reuse_sessions: bool = True
+    session_idle_seconds: int = 300
+    max_sessions: int = 16
+    # TTL for cached read-only REST metadata (0 disables).
+    cache_ttl_seconds: int = 60
 
 
 @dataclass
@@ -94,6 +117,13 @@ class ServerConfig:
     http_host: str = "127.0.0.1"
     http_port: int = 8080
     http_path: str = "/mcp"
+    # Static bearer token required on the HTTP transports when set (empty = open;
+    # rely on a reverse proxy instead). Gemini Enterprise and other remote
+    # clients send it as "Authorization: Bearer <token>".
+    http_bearer_token: str = ""
+    # Stateless Streamable HTTP: no session id handshake, every request is
+    # independent. Simplest mode for remote clients behind load balancers.
+    http_stateless: bool = False
     log_level: str = "INFO"
 
 
@@ -107,6 +137,7 @@ _LEGACY_TOOL_FLAGS = {
     "qlik_get_fields": "get_fields",
     "qlik_get_sheet_details": "get_sheet_details",
     "qlik_get_hypercube_data": "get_hypercube_data",
+    "qlik_create_data_object": "get_hypercube_data",
     "qlik_create_sheet": "create_sheet",
 }
 
@@ -118,15 +149,31 @@ class ToolSettings:
     get_fields: bool = True
     create_sheet: bool = True
     search: bool = True
+    # Which part of the catalog to expose: full, analytics, or readonly.
+    profile: str = "full"
     disabled_tools: list[str] = field(default_factory=list)
+    disabled_groups: list[str] = field(default_factory=list)
     max_hypercube_rows: int = 10000
     max_hypercube_columns: int = 50
+    # Gate for every tool that changes something in Qlik Cloud.
+    allow_writes: bool = True
+    # Gate for the sheet-building tools specifically (subset of writes).
     allow_sheet_creation: bool = True
     created_sheet_prefix: str = "[Agent] "
+    # Responses larger than this (in characters of JSON) are trimmed.
+    max_response_chars: int = 80000
 
-    def is_enabled(self, tool_name: str) -> bool:
+    @property
+    def writes_allowed(self) -> bool:
+        return self.allow_writes and self.profile != "readonly"
+
+    def is_enabled(self, tool_name: str, group: str = "") -> bool:
         """Whether a tool should be registered (write gating is applied separately)."""
         if tool_name in {name.strip() for name in self.disabled_tools}:
+            return False
+        if group and group in {name.strip() for name in self.disabled_groups}:
+            return False
+        if self.profile == "analytics" and group and group not in ANALYTICS_GROUPS:
             return False
         flag = _LEGACY_TOOL_FLAGS.get(tool_name)
         if flag is not None and not getattr(self, flag):
@@ -170,12 +217,24 @@ class Config:
                 token_url=env.get("QLIK_OAUTH_TOKEN_URL", ""),
             )
 
+        if env.get("QLIK_MCP_PROFILE"):
+            config.tools.profile = env["QLIK_MCP_PROFILE"].strip().lower()
         if env.get("QLIK_MCP_DISABLED_TOOLS"):
-            config.tools.disabled_tools = [
-                name.strip() for name in env["QLIK_MCP_DISABLED_TOOLS"].split(",") if name.strip()
-            ]
+            config.tools.disabled_tools = _csv(env["QLIK_MCP_DISABLED_TOOLS"])
+        if env.get("QLIK_MCP_DISABLED_GROUPS"):
+            config.tools.disabled_groups = _csv(env["QLIK_MCP_DISABLED_GROUPS"])
+        if env.get("QLIK_MCP_ALLOW_WRITES"):
+            config.tools.allow_writes = _truthy(env["QLIK_MCP_ALLOW_WRITES"])
+        if env.get("QLIK_MCP_HTTP_BEARER_TOKEN"):
+            config.server.http_bearer_token = env["QLIK_MCP_HTTP_BEARER_TOKEN"]
+        if env.get("QLIK_MCP_HTTP_STATELESS"):
+            config.server.http_stateless = _truthy(env["QLIK_MCP_HTTP_STATELESS"])
+        if env.get("QLIK_REUSE_SESSIONS"):
+            config.qlik.reuse_sessions = _truthy(env["QLIK_REUSE_SESSIONS"])
         if env.get("QLIK_MCP_TRANSPORT"):
             config.server.transport = env["QLIK_MCP_TRANSPORT"]
+        if env.get("QLIK_MCP_HTTP_HOST"):
+            config.server.http_host = env["QLIK_MCP_HTTP_HOST"]
         if env.get("QLIK_MCP_HTTP_PORT"):
             try:
                 config.server.http_port = int(env["QLIK_MCP_HTTP_PORT"])
@@ -204,6 +263,10 @@ class Config:
             server_data = {
                 _LEGACY_SERVER_KEYS.get(k, k): v for k, v in data["server"].items()
             }
+            # A token placeholder left unresolved must not become the token.
+            token = server_data.get("http_bearer_token")
+            if isinstance(token, str) and token.startswith("${"):
+                server_data["http_bearer_token"] = ""
             config.server = ServerConfig(**{
                 k: v for k, v in server_data.items()
                 if k in ServerConfig.__dataclass_fields__
@@ -211,11 +274,14 @@ class Config:
 
         if "tools" in data and data["tools"]:
             tools_data = dict(data["tools"])
-            disabled = tools_data.get("disabled_tools")
-            if isinstance(disabled, str):
-                tools_data["disabled_tools"] = [n.strip() for n in disabled.split(",") if n.strip()]
-            elif disabled is None:
-                tools_data.pop("disabled_tools", None)
+            for key in ("disabled_tools", "disabled_groups"):
+                disabled = tools_data.get(key)
+                if isinstance(disabled, str):
+                    tools_data[key] = _csv(disabled)
+                elif disabled is None:
+                    tools_data.pop(key, None)
+            if isinstance(tools_data.get("profile"), str):
+                tools_data["profile"] = tools_data["profile"].strip().lower()
             config.tools = ToolSettings(**{
                 k: v for k, v in tools_data.items()
                 if k in ToolSettings.__dataclass_fields__
@@ -254,8 +320,16 @@ class Config:
         if isinstance(port, bool) or not isinstance(port, int) or not (1 <= port <= 65535):
             errors.append("server.http_port must be an integer between 1 and 65535")
 
+        if self.tools.profile not in VALID_PROFILES:
+            errors.append(
+                f"tools.profile must be one of {', '.join(VALID_PROFILES)}, got '{self.tools.profile}'"
+            )
+
         if self.tools.max_hypercube_rows < 1:
             errors.append("tools.max_hypercube_rows must be >= 1")
+
+        if self.qlik.session_idle_seconds < 0 or self.qlik.max_sessions < 1:
+            errors.append("qlik.session_idle_seconds must be >= 0 and qlik.max_sessions >= 1")
 
         return errors
 

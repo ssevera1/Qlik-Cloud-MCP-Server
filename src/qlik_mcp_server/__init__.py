@@ -4,4 +4,4 @@ Model Context Protocol server exposing Qlik Cloud capabilities
 as standardized tools for AI agents.
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"

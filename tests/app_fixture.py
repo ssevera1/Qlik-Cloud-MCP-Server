@@ -1,4 +1,8 @@
-"""A fake Qlik app served over FakeWebSocket, rich enough for every engine tool."""
+"""A fake Qlik app served over FakeWebSocket, rich enough for every engine tool.
+
+Responses use the raw engine wire format: results wrapped by parameter name
+(qLayout, qProp, qList, qReturn, qDataPages, qResult, qSuccess, qScript).
+"""
 
 from __future__ import annotations
 
@@ -16,6 +20,9 @@ HANDLES = {
     CHART_ID: 11,
     LISTBOX_ID: 12,
 }
+FIELD_HANDLE = 5
+DIMENSION_HANDLE = 43
+MEASURE_HANDLE = 44
 
 SHEET_LAYOUT = {
     "qInfo": {"qId": SHEET_ID, "qType": "sheet"},
@@ -101,6 +108,49 @@ MASTER_LISTS_LAYOUT = {
     ]},
 }
 
+SELECTIONS_LAYOUT = {
+    "qSelectionObject": {
+        "qBackCount": 1,
+        "qForwardCount": 0,
+        "qSelections": [{
+            "qField": "Region",
+            "qSelected": "East",
+            "qSelectedCount": 1,
+            "qTotal": 3,
+            "qLocked": False,
+            "qSelectedFieldSelectionInfo": [{"qName": "East"}],
+        }],
+    },
+}
+
+HYPERCUBE_LAYOUT = {
+    "qHyperCube": {
+        "qDimensionInfo": [{"qFallbackTitle": "Region"}],
+        "qMeasureInfo": [{"qFallbackTitle": "Sum(Sales)"}],
+        "qSize": {"qcx": 2, "qcy": 1},
+        "qDataPages": [{"qMatrix": [[{"qText": "East"}, {"qText": "100", "qNum": 100}]]}],
+    },
+}
+
+FIELD_LIST_LAYOUT = {
+    "qFieldList": {"qItems": [
+        {"qName": "Region", "qCardinal": 3, "qTags": ["$text"], "qSrcTables": ["Sales"]},
+        {"qName": "Sales", "qCardinal": 40, "qTags": ["$numeric"], "qSrcTables": ["Sales"]},
+    ]},
+}
+
+MEASURE_PROPERTIES = {
+    "qInfo": {"qId": "measure-lib-1", "qType": "measure"},
+    "qMeasure": {"qDef": "Sum(Margin)/Sum(Sales)", "qLabel": "Margin", "qGrouping": "N"},
+    "qMetaDef": {"title": "Margin", "description": "Gross margin", "tags": []},
+}
+
+DIMENSION_PROPERTIES = {
+    "qInfo": {"qId": "dim-1", "qType": "dimension"},
+    "qDim": {"qGrouping": "N", "qFieldDefs": ["Region"], "qFieldLabels": ["Region"], "title": "Region"},
+    "qMetaDef": {"title": "Region", "description": "Sales region", "tags": ["geo"]},
+}
+
 SEARCH_RESULT = {
     "qSearchGroupArray": [
         {"qId": 0, "qGroupType": "DatasetType", "qItems": [
@@ -122,19 +172,34 @@ APP_LAYOUT = {
 }
 
 
+def _copy(props: dict) -> dict:
+    return {k: (dict(v) if isinstance(v, dict) else v) for k, v in props.items()}
+
+
 def build_app_ws() -> FakeWebSocket:
     """A FakeWebSocket that behaves like a small app with one sheet and one chart."""
     state = {"last_object": None, "session_objects": {}, "next_session": 100, "children": 0}
+
+    def generic(handle: int, generic_id: str) -> dict:
+        return {"qInfo": {"qId": generic_id},
+                "qReturn": {"qType": "GenericObject", "qHandle": handle, "qGenericId": generic_id}}
 
     def responder(msg: dict):
         method = msg["method"]
         handle = msg["handle"]
         params = msg["params"]
 
+        # ── Global / Doc ──────────────────────────────────────────
         if method == "OpenDoc":
             return {"qReturn": {"qType": "Doc", "qHandle": DOC}}
         if method == "GetAppLayout":
             return {"qLayout": APP_LAYOUT}
+        if method == "GetScript":
+            return {"qScript": "LOAD * FROM Sales;"}
+        if method in ("AddAlternateState", "RemoveAlternateState", "ClearAll", "SetProperties", "DoSave"):
+            return {}
+        if method in ("DestroySessionObject", "DestroyBookmark", "DestroyDimension", "DestroyMeasure"):
+            return {"qSuccess": True}
         if method == "GetObjects":
             return {"qList": [{
                 "qInfo": {"qId": SHEET_ID, "qType": "sheet"},
@@ -147,8 +212,47 @@ def build_app_ws() -> FakeWebSocket:
                 return {"qReturn": {"qType": "Null", "qHandle": -1}}
             state["last_object"] = obj_id
             return {"qReturn": {"qType": "GenericObject", "qHandle": HANDLES[obj_id]}}
+        if method == "GetField":
+            return {"qReturn": {"qType": "Field", "qHandle": FIELD_HANDLE}}
+        if method == "GetDimension":
+            return {"qReturn": {"qType": "GenericDimension", "qHandle": DIMENSION_HANDLE}}
+        if method == "GetMeasure":
+            return {"qReturn": {"qType": "GenericMeasure", "qHandle": MEASURE_HANDLE}}
+        if method == "CreateSessionObject":
+            prop = params[0]
+            h = state["next_session"]
+            state["next_session"] += 1
+            if "qListObjectDef" in prop:
+                kind = "field_values"
+            elif "qDimensionListDef" in prop or "qMeasureListDef" in prop or "qBookmarkListDef" in prop:
+                kind = "master_lists"
+            elif "qFieldListDef" in prop:
+                kind = "fields"
+            elif "qSelectionObjectDef" in prop:
+                kind = "selections"
+            else:
+                kind = "hypercube"
+            state["session_objects"][h] = kind
+            return generic(h, f"session-{h}")
+        if method == "CreateObject":
+            return {"qReturn": {"qType": "GenericObject", "qHandle": 20, "qGenericId": "new-sheet"}}
+        if method == "CreateBookmark":
+            return generic(40, "bm-new")
+        if method == "CreateDimension":
+            return generic(41, "dim-new")
+        if method == "CreateMeasure":
+            return generic(42, "measure-new")
+        if method == "SearchResults":
+            return {"qResult": SEARCH_RESULT}
+        if method == "ApplyBookmark":
+            return {"qSuccess": params[0] == "bm-1"}
+
+        # ── Field ─────────────────────────────────────────────────
+        if method in ("SelectValues", "Select", "Clear"):
+            return {"qReturn": True}
+
+        # ── Generic objects ───────────────────────────────────────
         if method == "GetLayout":
-            # The raw engine wraps the layout: {"qLayout": {...}}
             if handle == HANDLES[SHEET_ID]:
                 return {"qLayout": SHEET_LAYOUT}
             if handle == HANDLES[CHART_ID]:
@@ -156,65 +260,35 @@ def build_app_ws() -> FakeWebSocket:
             if handle == HANDLES[LISTBOX_ID]:
                 return {"qLayout": LISTBOX_LAYOUT}
             kind = state["session_objects"].get(handle)
-            if kind == "field_values":
-                return {"qLayout": FIELD_VALUES_LAYOUT}
-            if kind == "master_lists":
-                return {"qLayout": MASTER_LISTS_LAYOUT}
-            if kind == "hypercube":
-                return {"qLayout": {"qHyperCube": {
-                    "qDimensionInfo": [{"qFallbackTitle": "Region"}],
-                    "qMeasureInfo": [{"qFallbackTitle": "Sum(Sales)"}],
-                    "qSize": {"qcx": 2, "qcy": 1},
-                    "qDataPages": [{"qMatrix": [[{"qText": "East"}, {"qText": "100", "qNum": 100}]]}],
-                }}}
-            if kind == "fields":
-                return {"qLayout": {"qFieldList": {"qItems": [
-                    {"qName": "Region", "qCardinal": 3, "qTags": ["$text"], "qSrcTables": ["Sales"]},
-                    {"qName": "Sales", "qCardinal": 40, "qTags": ["$numeric"], "qSrcTables": ["Sales"]},
-                ]}}}
-            return {"qLayout": {}}
+            layouts = {
+                "field_values": FIELD_VALUES_LAYOUT,
+                "master_lists": MASTER_LISTS_LAYOUT,
+                "fields": FIELD_LIST_LAYOUT,
+                "selections": SELECTIONS_LAYOUT,
+                "hypercube": HYPERCUBE_LAYOUT,
+            }
+            return {"qLayout": layouts.get(kind, {})}
         if method == "GetProperties":
             if handle == HANDLES[CHART_ID]:
                 return {"qProp": CHART_PROPERTIES}
             if handle == HANDLES[SHEET_ID]:
                 return {"qProp": {"qInfo": SHEET_LAYOUT["qInfo"], "cells": list(SHEET_LAYOUT["cells"]),
                                   "columns": 24, "rows": 12}}
+            if handle == MEASURE_HANDLE:
+                return {"qProp": _copy(MEASURE_PROPERTIES)}
+            if handle == DIMENSION_HANDLE:
+                return {"qProp": _copy(DIMENSION_PROPERTIES)}
             return {"qProp": {}}
-        if method == "CreateSessionObject":
-            prop = params[0]
-            h = state["next_session"]
-            state["next_session"] += 1
-            if "qListObjectDef" in prop:
-                state["session_objects"][h] = "field_values"
-            elif "qDimensionListDef" in prop or "qMeasureListDef" in prop or "qBookmarkListDef" in prop:
-                state["session_objects"][h] = "master_lists"
-            elif "qFieldListDef" in prop:
-                state["session_objects"][h] = "fields"
-            else:
-                state["session_objects"][h] = "hypercube"
-            return {"qReturn": {"qType": "GenericObject", "qHandle": h}}
         if method == "GetHyperCubeData":
             return {"qDataPages": [{"qMatrix": []}]}
         if method == "GetListObjectData":
             return {"qDataPages": [{"qMatrix": []}]}
         if method == "SearchListObjectFor":
             return {"qSuccess": True}
-        if method == "SearchResults":
-            return {"qResult": SEARCH_RESULT}
-        if method == "ApplyBookmark":
-            return {"qSuccess": params[0] == "bm-1"}
-        if method == "GetField":
-            return {"qReturn": {"qType": "Field", "qHandle": 5}}
-        if method == "SelectValues":
-            return {"qReturn": True}
-        if method == "CreateObject":
-            return {"qReturn": {"qType": "GenericObject", "qHandle": 20, "qGenericId": "new-sheet"}}
         if method == "CreateChild":
             state["children"] += 1
             cid = f"child-{state['children']}"
-            return {"qReturn": {"qType": "GenericObject", "qHandle": 30 + state["children"], "qGenericId": cid}}
-        if method in ("SetProperties", "DoSave"):
-            return {}
+            return generic(30 + state["children"], cid)
         return {}
 
     return FakeWebSocket(responder)

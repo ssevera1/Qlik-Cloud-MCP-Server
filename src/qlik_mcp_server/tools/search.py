@@ -113,4 +113,5 @@ SEARCH_SPEC = ToolSpec(
     description=TOOL_DESCRIPTION,
     input_model=SearchInput,
     run=lambda ctx, params: handle_search(ctx.qlik_client, params),
+    group="discover",
 )

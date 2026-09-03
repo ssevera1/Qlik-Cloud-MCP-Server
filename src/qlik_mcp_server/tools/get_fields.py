@@ -58,4 +58,5 @@ GET_FIELDS_SPEC = ToolSpec(
     description=TOOL_DESCRIPTION,
     input_model=GetFieldsInput,
     run=lambda ctx, params: handle_get_fields(ctx.engine, params),
+    group="model",
 )

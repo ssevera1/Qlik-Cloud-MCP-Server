@@ -21,11 +21,12 @@ Architecture documentation for the Qlik Cloud MCP Server, the standardized integ
 | ADR-002 | WebSocket Engine API over REST-Only for Hypercube Data | Accepted |
 | ADR-003 | API Key as Default Auth with OAuth2 M2M as Alternative | Accepted |
 | ADR-004 | Stateless Tool Calls over Persistent Engine Sessions | Accepted |
-| ADR-005 | Tool Granularity: Focused Tools over One Generic Tool | Accepted (updated 2026-09-02, parity with Qlik hosted MCP: 16 tools) |
+| ADR-005 | Tool Granularity: Focused Tools over One Generic Tool | Accepted (updated 2026-09-02: 107 tools, sized by profile) |
+| ADR-006 | Session Reuse, Client-Neutral Schemas, and Authenticated HTTP | Accepted |
 
 ## Keeping these current
 
-The diagrams describe the code as of version 0.3.0. When a tool is added or a transport changes, update the C2 container list, the C3 sequences, the C4 class diagram, and the relevant ADR in the same change.
+The diagrams describe the code as of version 0.4.0. When a tool is added or a transport changes, update the C2 container list, the C3 sequences, the C4 class diagram, and the relevant ADR in the same change.
 
 ## Rendering Diagrams
 

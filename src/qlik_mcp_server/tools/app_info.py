@@ -25,6 +25,14 @@ class ListSheetsInput(BaseModel):
     app_id: str = Field(description="The Qlik Cloud app ID whose sheets to list")
 
 
+class GetAppScriptInput(BaseModel):
+    """Input schema for qlik_get_app_script."""
+
+    app_id: str = Field(description="The Qlik Cloud app ID whose load script to read")
+    max_chars: int = Field(default=20000, ge=500, le=200000,
+                           description="Maximum characters of script to return (default 20000)")
+
+
 DESCRIBE_APP_DESCRIPTION = (
     "Get an overview of a Qlik Cloud app: name, description, owner, space, last reload time, "
     "whether Section Access applies, the data model tables, and counts of sheets, fields, "
@@ -111,6 +119,32 @@ async def handle_describe_app(ctx: ToolContext, params: dict) -> dict:
     return payload
 
 
+GET_APP_SCRIPT_DESCRIPTION = (
+    "Read the load script of a Qlik Cloud app to understand where its data comes from and how "
+    "fields are derived (data sources, joins, calculated fields, Section Access). Long scripts "
+    "are truncated at max_chars."
+)
+
+
+async def handle_get_app_script(ctx: ToolContext, params: dict) -> dict:
+    """Execute the qlik_get_app_script tool."""
+    input_data = GetAppScriptInput(**params)
+    try:
+        async with ctx.engine.open_app(input_data.app_id) as session:
+            script = await session.get_script()
+            truncated = len(script) > input_data.max_chars
+            return {
+                "app_id": input_data.app_id,
+                "length": len(script),
+                "truncated": truncated,
+                "script": script[: input_data.max_chars],
+            }
+    except EngineError as e:
+        logger.error("Engine error in get_app_script: %s", e)
+        return {"error": str(e), "app_id": input_data.app_id,
+                "hint": "Verify the app_id exists and the service account can open the app."}
+
+
 async def handle_list_sheets(ctx: ToolContext, params: dict) -> dict:
     """Execute the qlik_list_sheets tool."""
     input_data = ListSheetsInput(**params)
@@ -130,6 +164,7 @@ DESCRIBE_APP_SPEC = ToolSpec(
     description=DESCRIBE_APP_DESCRIPTION,
     input_model=DescribeAppInput,
     run=handle_describe_app,
+    group="discover",
 )
 
 LIST_SHEETS_SPEC = ToolSpec(
@@ -138,4 +173,14 @@ LIST_SHEETS_SPEC = ToolSpec(
     description=LIST_SHEETS_DESCRIPTION,
     input_model=ListSheetsInput,
     run=handle_list_sheets,
+    group="dashboards",
+)
+
+GET_APP_SCRIPT_SPEC = ToolSpec(
+    name="qlik_get_app_script",
+    title="Get app load script",
+    description=GET_APP_SCRIPT_DESCRIPTION,
+    input_model=GetAppScriptInput,
+    run=handle_get_app_script,
+    group="discover",
 )

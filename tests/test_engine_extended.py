@@ -67,7 +67,7 @@ class TestSearchFieldValues:
         assert call["handle"] == DOC
         options, terms, page = call["params"]
         assert options["qSearchFields"] == ["Region", "City"]
-        assert options["qContext"] == "Cleared"
+        assert options["qContext"] == "CurrentSelections"
         assert terms == ["east"]
         assert page["qMaxNbrFieldMatches"] == 5
         assert result["matches"] == [

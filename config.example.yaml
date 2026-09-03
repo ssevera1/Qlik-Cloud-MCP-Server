@@ -1,5 +1,6 @@
 # Qlik Cloud MCP Server - Configuration
 # Copy to config.yaml and fill in your Qlik Cloud tenant details.
+# Every setting here can also be given as an environment variable (see README).
 
 qlik:
   tenant_url: https://your-tenant.us.qlikcloud.com
@@ -13,51 +14,70 @@ qlik:
   #   client_secret: ${QLIK_OAUTH_CLIENT_SECRET}
   #   token_url: https://your-tenant.us.qlikcloud.com/oauth/token   # optional, derived from tenant_url
 
-  # Default app ID for tools that don't specify one
-  # default_app_id: ""
-
   # Connection settings
   timeout_seconds: 30
   max_retries: 3
 
+  # Performance. One Engine WebSocket per app is kept open between tool calls
+  # (saves the connect + OpenDoc round trips, roughly half a second per call)
+  # and closed after session_idle_seconds without use. Selections made with
+  # qlik_select_values live on that session; per-call filters never touch it.
+  reuse_sessions: true
+  session_idle_seconds: 300
+  max_sessions: 16
+  # Read-only REST metadata (app attributes, lists) is cached for this long; 0 disables.
+  cache_ttl_seconds: 60
+
 server:
   # Transport:
   #   "stdio"           (default) local agents such as Claude Code / Claude Desktop
-  #   "streamable-http" HTTP server for remote agents (current MCP spec transport)
+  #   "streamable-http" HTTP server for remote agents such as Gemini Enterprise
   #   "sse"             legacy HTTP transport, deprecated in the MCP spec
   transport: stdio
 
   # HTTP settings (only used when transport is streamable-http or sse).
-  # Bind to 127.0.0.1 unless you put the server behind an authenticating proxy:
-  # the MCP endpoint itself is unauthenticated and holds your Qlik credentials.
   http_host: 127.0.0.1
   http_port: 8080
   http_path: /mcp
+  # Require "Authorization: Bearer <token>" on every MCP request. Set this
+  # whenever the server is reachable beyond localhost; the endpoint otherwise
+  # hands your Qlik credentials to anyone who can reach it.
+  http_bearer_token: ${QLIK_MCP_HTTP_BEARER_TOKEN}
+  # Stateless Streamable HTTP: no session handshake, every request independent.
+  # Simplest mode behind load balancers and for Gemini Enterprise.
+  http_stateless: false
 
-  # Logging
+  # Logging (stderr; stdout is reserved for the stdio transport)
   log_level: INFO
 
 tools:
-  # Hide tools by name. All 16 tools are enabled by default:
-  #   qlik_search, qlik_describe_app, qlik_get_fields, qlik_get_field_values,
-  #   qlik_search_field_values, qlik_list_sheets, qlik_get_sheet_details,
-  #   qlik_get_chart_info, qlik_get_chart_data, qlik_list_dimensions,
-  #   qlik_list_measures, qlik_list_bookmarks, qlik_get_hypercube_data,
-  #   qlik_create_sheet, qlik_add_chart, qlik_add_filter
+  # Which tools to expose. 107 tools in 19 groups are available; see README.
+  #   full       every tool (default)
+  #   analytics  the app-analysis tools only (discover, model, dashboards, master
+  #              items, bookmarks, selections, compute, build, answers, lineage)
+  #   readonly   every read tool, no writes
+  profile: full
+
+  # Hide whole groups or individual tools by name.
+  disabled_groups: []
   disabled_tools: []
 
-  # Legacy per-tool switches (still honored)
+  # Gate for every tool that changes something in Qlik Cloud (creates, updates,
+  # deletes, starts runs or reloads). false gives a strictly read-only server.
+  allow_writes: true
+  # Gate for the sheet-building tools specifically (a subset of the writes).
+  allow_sheet_creation: true
+  created_sheet_prefix: "[Agent] "
+
+  # Data limits
+  max_hypercube_rows: 10000
+  max_hypercube_columns: 50
+  # Responses larger than this (characters of JSON) are trimmed with a note.
+  max_response_chars: 80000
+
+  # Legacy per-tool switches from the four-tool era (still honored)
   search: true
   get_fields: true
   get_sheet_details: true
   get_hypercube_data: true
   create_sheet: true
-
-  # Hypercube limits
-  max_hypercube_rows: 10000
-  max_hypercube_columns: 50
-
-  # Write tools (qlik_create_sheet, qlik_add_chart, qlik_add_filter).
-  # Set to false for a read-only server; the three tools are then not registered.
-  allow_sheet_creation: true
-  created_sheet_prefix: "[Agent] "

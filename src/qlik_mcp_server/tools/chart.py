@@ -8,6 +8,7 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 from ..engine_client import EngineError
+from .get_hypercube_data import FORMAT_DESCRIPTION, OutputFormat
 from .spec import ToolContext, ToolSpec
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,7 @@ class GetChartDataInput(BaseModel):
         default=1000, ge=1,
         description="Maximum number of rows to return (default 1000; capped by server config)",
     )
+    format: Optional[OutputFormat] = Field(default="json", description=FORMAT_DESCRIPTION)
 
 
 GET_CHART_INFO_DESCRIPTION = (
@@ -46,7 +48,7 @@ GET_CHART_INFO_DESCRIPTION = (
 GET_CHART_DATA_DESCRIPTION = (
     "Read the computed data behind an existing chart or list box in a Qlik Cloud app as a table. "
     "Use this to answer questions from a dashboard exactly as it is shown. For pivot or stacked "
-    "charts, use qlik_get_hypercube_data with the chart's dimensions and measures instead."
+    "charts, use qlik_create_data_object with the chart's dimensions and measures instead."
 )
 
 
@@ -70,7 +72,8 @@ async def handle_get_chart_data(ctx: ToolContext, params: dict, max_rows_limit: 
     try:
         async with ctx.engine.open_app(input_data.app_id) as session:
             result = await session.get_object_data(input_data.object_id, max_rows=effective_max)
-            return {"app_id": input_data.app_id, "object_id": input_data.object_id, **result.as_payload()}
+            return {"app_id": input_data.app_id, "object_id": input_data.object_id,
+                    **result.as_payload(input_data.format or "json")}
     except EngineError as e:
         logger.error("Engine error in get_chart_data: %s", e)
         return {"error": str(e), "app_id": input_data.app_id, "object_id": input_data.object_id,
@@ -83,6 +86,7 @@ GET_CHART_INFO_SPEC = ToolSpec(
     description=GET_CHART_INFO_DESCRIPTION,
     input_model=GetChartInfoInput,
     run=handle_get_chart_info,
+    group="dashboards",
 )
 
 GET_CHART_DATA_SPEC = ToolSpec(
@@ -93,4 +97,5 @@ GET_CHART_DATA_SPEC = ToolSpec(
     run=lambda ctx, params: handle_get_chart_data(
         ctx, params, max_rows_limit=ctx.config.tools.max_hypercube_rows,
     ),
+    group="dashboards",
 )

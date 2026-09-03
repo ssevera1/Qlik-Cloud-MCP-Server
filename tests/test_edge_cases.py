@@ -101,6 +101,7 @@ class TestHypercubeHandler:
         )
         methods = [m["method"] for m in ws.sent]
         assert methods.index("SelectValues") < methods.index("CreateSessionObject")
+        assert "AddAlternateState" in methods
 
     async def test_invalid_expression_surfaces_engine_error(self):
         def responder(msg):

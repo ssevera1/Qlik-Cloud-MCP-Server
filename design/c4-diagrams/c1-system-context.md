@@ -9,7 +9,7 @@ C4Context
     Person(developer, "Agent Developer", "Builds AI agents that need<br/>access to Qlik Cloud data")
     Person(endUser, "End User", "Asks questions via<br/>Teams/Slack/Chat")
 
-    System(mcpServer, "Qlik Cloud MCP Server", "Exposes Qlik Cloud capabilities<br/>as standardized MCP tools:<br/>search, fields, sheets,<br/>governed data, sheet creation")
+    System(mcpServer, "Qlik Cloud MCP Server", "107 MCP tools over Qlik Cloud:<br/>analytics apps, catalog and governance,<br/>automations, alerts, AutoML, reloads,<br/>Qlik Answers")
 
     System_Ext(aiAgent, "AI Agent (Vertex AI /<br/>Claude / LangChain)", "LLM-powered reasoning engine<br/>that calls MCP tools to<br/>fulfill user requests")
     System_Ext(qlikCloud, "Qlik Cloud Tenant", "Managed BI platform:<br/>apps, dashboards, data engine,<br/>Section Access security")
@@ -37,10 +37,10 @@ Key interactions:
 
 ### Relationship to Qlik's hosted MCP server
 
-Qlik Cloud tenants can also expose a vendor-hosted MCP server at `https://<tenant>/api/ai/mcp`, authenticated per user with OAuth and metered against tenant capacity. This project is a self-hosted alternative with a deliberately small tool surface and service-account authentication. Tool names mirror Qlik's naming where the capabilities overlap so agents and prompts transfer between the two.
+Qlik Cloud tenants can also expose a vendor-hosted MCP server at `https://<tenant>/api/ai/mcp`, authenticated per user with OAuth and metered against tenant capacity. This project is a self-hosted alternative that covers the same analytics, governance, automation, and AI families with service-account authentication, a per-app session pool for speed, and client-neutral schemas. Tool names mirror Qlik's naming wherever the capability exists there, so agents and prompts transfer between the two; `tools.profile` trims the catalog for narrower assistants.
 
 ### Security Model
 
 The MCP server authenticates to Qlik Cloud using a **service account API key** (or OAuth2 M2M credentials). All data access is governed by Qlik's **Section Access** rules: if the service account cannot see certain data, the tool returns an error or an empty result. The MCP server **never bypasses** Qlik security.
 
-The MCP endpoint itself carries no authentication. The stdio transport is a local process; the HTTP transports must stay bound to localhost or sit behind an authenticating proxy.
+The stdio transport is a local process. The HTTP transport requires a bearer token when `server.http_bearer_token` is set (the expected mode for Gemini Enterprise and any endpoint reachable beyond localhost) and otherwise relies on a localhost bind or an authenticating proxy.

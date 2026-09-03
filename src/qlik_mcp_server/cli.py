@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .config import VALID_TRANSPORTS, Config
+from .config import VALID_PROFILES, VALID_TRANSPORTS, Config
 
 
 def setup_logging(level: str = "INFO") -> None:
@@ -55,6 +55,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="HTTP port (overrides config file, used with streamable-http or sse)",
     )
     parser.add_argument(
+        "--profile",
+        choices=list(VALID_PROFILES),
+        default=None,
+        help="Tool profile: full, analytics, or readonly (overrides config file)",
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Enable debug logging",
@@ -62,7 +68,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--validate",
         action="store_true",
-        help="Validate config and exit without starting the server",
+        help="Validate config, list the enabled tools, and exit without starting the server",
+    )
+    parser.add_argument(
+        "--list-tools",
+        action="store_true",
+        help="Print every tool the current configuration exposes, grouped, and exit",
     )
 
     return parser
@@ -93,6 +104,8 @@ def main() -> int:
         config.server.http_host = args.host
     if args.port:
         config.server.http_port = args.port
+    if args.profile:
+        config.tools.profile = args.profile
     if args.verbose:
         config.server.log_level = "DEBUG"
 
@@ -104,20 +117,33 @@ def main() -> int:
             logging.error("Config error: %s", err)
         return 1
 
-    if args.validate:
-        from .tools.registry import TOOL_NAMES, enabled_specs
+    if args.validate or args.list_tools:
+        from .tools.registry import TOOL_NAMES, enabled_specs, tool_groups
 
         unknown = sorted(set(config.tools.disabled_tools) - set(TOOL_NAMES))
         for name in unknown:
             logging.warning("tools.disabled_tools names an unknown tool: %s", name)
-        enabled = [spec.name for spec in enabled_specs(config)]
+        unknown_groups = sorted(set(config.tools.disabled_groups) - set(tool_groups()))
+        for name in unknown_groups:
+            logging.warning("tools.disabled_groups names an unknown group: %s", name)
+
+        enabled = enabled_specs(config)
+        enabled_names = {spec.name for spec in enabled}
         print("Configuration is valid.")
         print(f"  Tenant: {config.tenant_host}")
         print(f"  Auth: {config.auth_mode}")
         print(f"  Transport: {config.server.transport}")
         if config.server.transport != "stdio":
-            print(f"  Bind: {config.server.http_host}:{config.server.http_port}")
-        print(f"  Tools enabled ({len(enabled)}/{len(TOOL_NAMES)}): {', '.join(enabled)}")
+            print(f"  Bind: {config.server.http_host}:{config.server.http_port}{config.server.http_path}")
+            print(f"  HTTP auth: {'bearer token' if config.server.http_bearer_token else 'none'}")
+        print(f"  Engine sessions: {'reused' if config.qlik.reuse_sessions else 'per call'}")
+        print(f"  Profile: {config.tools.profile} (writes {'allowed' if config.tools.writes_allowed else 'disabled'})")
+        print(f"  Tools enabled: {len(enabled)}/{len(TOOL_NAMES)}")
+        if args.list_tools:
+            for group, names in tool_groups().items():
+                active = [n for n in names if n in enabled_names]
+                if active:
+                    print(f"    {group} ({len(active)}): {', '.join(active)}")
         return 0
 
     from .server import run_server

@@ -14,11 +14,13 @@ C4Component
 
         Component(discover, "Discover", "tools/search.py, tools/app_info.py", "qlik_search,<br/>qlik_describe_app,<br/>qlik_list_sheets")
 
-        Component(model, "Data model", "tools/get_fields.py, tools/field_values.py, tools/master_items.py", "fields, field values,<br/>value search, master items,<br/>bookmarks")
+        Component(model, "Data model", "tools/get_fields.py, tools/field_values.py, tools/master_items.py, tools/selections.py", "fields, values, value search,<br/>master items and bookmarks (CRUD),<br/>selections")
 
         Component(dashboards, "Dashboards", "tools/get_sheet_details.py, tools/chart.py", "sheet details,<br/>chart info, chart data")
 
-        Component(compute, "Compute", "tools/get_hypercube_data.py", "governed hypercube data<br/>with filters or bookmark")
+        Component(compute, "Compute", "tools/get_hypercube_data.py", "qlik_create_data_object:<br/>governed data with isolated<br/>filters, bookmark, sort, format")
+
+        Component(platform, "Platform (REST)", "tools/rest_catalog.py", "automations, glossary, datasets,<br/>data products, lineage, knowledge,<br/>pipelines, alerts, ML, reloads,<br/>spaces, Qlik Answers")
 
         Component(build, "Build", "tools/create_sheet.py, tools/sheet_edit.py", "create sheet, add chart,<br/>add filter pane (writes)")
 
@@ -38,6 +40,8 @@ C4Component
     Rel(registry, dashboards, "specs")
     Rel(registry, compute, "specs")
     Rel(registry, build, "specs")
+    Rel(registry, platform, "specs")
+    Rel(platform, restClient, "call(method, path, params, body)")
 
     Rel(discover, restClient, "GET /api/v1/items, /apps/{id}")
     Rel(discover, engineClient, "list_sheets(), master items")
@@ -60,11 +64,16 @@ sequenceDiagram
     participant Engine as Qlik Engine API
 
     Tool->>Tool: validate app_id is a UUID
-    Tool->>Engine: WebSocket connect wss://tenant/app/{app_id}<br/>Authorization: Bearer ...
-    Tool->>Engine: OpenDoc(app_id) on handle -1
-    Engine-->>Tool: {qReturn: {qHandle: doc}}
+    alt no warm session for this app
+        Tool->>Engine: WebSocket connect wss://tenant/app/{app_id}<br/>Authorization: Bearer ...
+        Tool->>Engine: OpenDoc(app_id) on handle -1
+        Engine-->>Tool: {qReturn: {qHandle: doc}}
+    else warm session (qlik.reuse_sessions)
+        Note over Tool,Engine: reuse the open socket; calls to the same app are serialized
+    end
     Note over Tool,Engine: tool-specific calls; results are unwrapped<br/>(qLayout, qDataPages, qResult, qList, qProp)
-    Tool->>Engine: Close WebSocket
+    Tool->>Engine: DestroySessionObject for temporary objects
+    Note over Tool,Engine: socket stays open until session_idle_seconds pass
 ```
 
 ## Tool Interaction Sequences
@@ -126,7 +135,7 @@ sequenceDiagram
     MCP-->>Agent: {values: [{value, state, frequency}], total_values}
 
     Agent->>MCP: tools/call("qlik_search_field_values", {app_id, terms, fields?})
-    MCP->>Engine: SearchResults({qSearchFields, qContext: "Cleared"}, terms, page)
+    MCP->>Engine: SearchResults({qSearchFields, qContext: "CurrentSelections"}, terms, page)
     Engine-->>MCP: qResult.qSearchGroupArray
     MCP-->>Agent: {matches: [{field, values}]}
 ```
@@ -201,7 +210,7 @@ sequenceDiagram
     MCP-->>Agent: {headers, data, row_count, total_rows, truncated, table}
 ```
 
-### qlik_get_hypercube_data
+### qlik_create_data_object
 
 ```mermaid
 sequenceDiagram
@@ -209,7 +218,7 @@ sequenceDiagram
     participant MCP as MCP Server
     participant Engine as Qlik Engine API
 
-    Agent->>MCP: tools/call("qlik_get_hypercube_data",<br/>{app_id, dimensions, measures, filters?, bookmark_id?, max_rows?})
+    Agent->>MCP: tools/call("qlik_create_data_object",<br/>{app_id, dimensions, measures, filters?, bookmark_id?, sort_by?, max_rows?, format?})
     MCP->>MCP: clamp max_rows, check column limit
 
     opt bookmark_id given
@@ -217,19 +226,66 @@ sequenceDiagram
         Engine-->>MCP: qSuccess (false is an error to the agent)
     end
 
-    loop each filter
-        MCP->>Engine: GetField(name) + SelectValues(handle, values)
-        Engine-->>MCP: qReturn (false when nothing matched)
+    opt filters given
+        MCP->>Engine: AddAlternateState(temp)
+        loop each filter
+            MCP->>Engine: GetField(name, temp) + SelectValues(handle, values)
+            Engine-->>MCP: qReturn (false when nothing matched)
+        end
     end
 
-    MCP->>Engine: CreateSessionObject({qHyperCubeDef:<br/>{qDimensions, qMeasures, qInitialDataFetch}})
+    MCP->>Engine: CreateSessionObject({qHyperCubeDef:<br/>{qDimensions, qMeasures, qStateName: temp?, qInitialDataFetch}})
     MCP->>Engine: GetLayout(handle)
     Engine-->>MCP: qHyperCube (info, qSize, first page)
     opt more rows needed
         MCP->>Engine: GetHyperCubeData(handle, "/qHyperCubeDef", [page])
     end
+    opt filters given
+        MCP->>Engine: RemoveAlternateState(temp)
+    end
 
-    MCP-->>Agent: {headers, data, total_rows, truncated,<br/>filters_applied, filters_not_matched, bookmark_applied, table}
+    MCP-->>Agent: {columns, rows | table | csv, total_rows, truncated,<br/>filters_applied, filters_not_matched, bookmark_applied}
+```
+
+### qlik_select_values, qlik_get_current_selections, qlik_clear_selections
+
+```mermaid
+sequenceDiagram
+    participant Agent as AI Agent
+    participant MCP as MCP Server
+    participant Engine as Qlik Engine API
+
+    Agent->>MCP: tools/call("qlik_select_values", {app_id, field, values | match})
+    MCP->>Engine: GetField(field)
+    alt exact values
+        MCP->>Engine: SelectValues(handle, [{qText}], toggle, false)
+    else search pattern
+        MCP->>Engine: Select(handle, match, false, 0)
+    end
+    MCP->>Engine: CreateSessionObject({qSelectionObjectDef}) + GetLayout
+    Engine-->>MCP: qSelectionObject.qSelections
+    MCP-->>Agent: {applied, current_selections}
+    Note over MCP,Engine: the selection stays on the app session for later calls
+
+    Agent->>MCP: tools/call("qlik_clear_selections", {app_id, fields?})
+    MCP->>Engine: ClearAll() or GetField + Clear() per field
+    MCP-->>Agent: {cleared}
+```
+
+### REST-backed tools (automations, governance, platform)
+
+```mermaid
+sequenceDiagram
+    participant Agent as AI Agent
+    participant MCP as MCP Server
+    participant REST as Qlik Cloud REST API
+
+    Agent->>MCP: tools/call("qlik_<family>_<verb>", {...})
+    MCP->>MCP: RestTool spec: fill path, build query and body<br/>(camelCase names, JSON Patch for updates)
+    MCP->>REST: METHOD /api/v1/... or /api/data-governance/...
+    REST-->>MCP: JSON (or text for logs and markdown)
+    MCP->>MCP: shape the result (snake_case, trimmed, cursors kept)
+    MCP-->>Agent: payload
 ```
 
 ### qlik_create_sheet, qlik_add_chart, qlik_add_filter

@@ -19,7 +19,13 @@ class ToolContext:
 
 @dataclass(frozen=True)
 class ToolSpec:
-    """One MCP tool: its schema (a Pydantic model), description, and handler."""
+    """One MCP tool: its schema (a Pydantic model), description, and handler.
+
+    ``writes`` marks tools that change persisted content in Qlik Cloud (they
+    are hidden when ``tools.allow_writes`` is false). ``stateful`` marks tools
+    that only change the engine session's selection state; they are neither
+    read-only nor persisted writes.
+    """
 
     name: str
     title: str
@@ -27,3 +33,5 @@ class ToolSpec:
     input_model: type[BaseModel]
     run: Callable[[ToolContext, dict], Awaitable[dict]]
     writes: bool = False
+    stateful: bool = False
+    group: str = "general"
