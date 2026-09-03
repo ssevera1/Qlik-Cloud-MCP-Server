@@ -227,18 +227,40 @@ For a remote server: `claude mcp add --transport http qlik-cloud https://mcp.exa
 
 ## Gemini Enterprise
 
-Run the server with the Streamable HTTP transport behind HTTPS (a reverse proxy or your platform's ingress), set `server.http_bearer_token`, and prefer stateless mode:
+Gemini Enterprise requires HTTPS and the Streamable HTTP transport; SSE is not supported. Its custom MCP connector offers three ways to authenticate, and a static header is not one of them, so `server.http_bearer_token` does not apply here. Run the server stateless behind HTTPS:
 
 ```yaml
 server:
   transport: streamable-http
   http_host: 0.0.0.0
   http_port: 8080
-  http_bearer_token: ${QLIK_MCP_HTTP_BEARER_TOKEN}
   http_stateless: true
 ```
 
-Register `https://your-host/mcp` as an MCP tool source in Gemini Enterprise with an `Authorization: Bearer <token>` header. Tool schemas are already in the subset Gemini accepts (no `$ref`, `$defs`, `anyOf`, or `title`), and a test enforces that for every tool.
+**Recommended: Cloud Run with IAM.** Deploy to Cloud Run on its default `.run.app` domain and grant the Gemini Enterprise service agent `roles/run.invoker`. Gemini Enterprise then sends a Google-signed ID token in `X-Serverless-Authorization` on every request, and Cloud Run rejects everything else before it reaches the server. Leave `http_bearer_token` unset, because IAM is the gate.
+
+**Alternative: an OAuth 2.0 front door.** Put Identity-Aware Proxy or an API gateway in front, then choose OAuth 2.0 in the connector and give it that gateway's authorization URL, token URL, client ID, client secret, and scopes. Register `https://vertexaisearch.cloud.google.com/oauth-redirect` as the redirect URI with your identity provider.
+
+Do not expose the endpoint with "No authentication" on the public internet; that hands your Qlik service account to anyone who finds the URL.
+
+Tool schemas are already in the subset Gemini accepts, with no `$ref`, `$defs`, `anyOf`, or `title`, and a test enforces that for every tool.
+
+### Analyst access: hosted server or this one
+
+This server authenticates to Qlik with one service account, so every analyst sees the same slice of data regardless of their own Qlik entitlements. For analyst-facing deployments where Section Access and space membership must follow the person asking, connect Gemini Enterprise to Qlik's hosted MCP server instead, which authorizes each user individually. In the connector, choose OAuth 2.0 and fill in:
+
+| Field | Value |
+|---|---|
+| MCP Server URL | `https://<tenant>.<region>.qlikcloud.com/api/ai/mcp` |
+| Authorization URL | the authorize endpoint shown on the OAuth client's detail page in Qlik |
+| Token URL | the token endpoint shown on that same page |
+| Client ID and Client Secret | from a **Web** OAuth client created in the Qlik Administration activity center |
+| Scopes | `user_default mcp:execute offline_access` |
+| Enable PKCE | on |
+
+Register `https://vertexaisearch.cloud.google.com/oauth-redirect` as the redirect URI on that Qlik OAuth client. The same two prerequisites apply as for Claude Code: a tenant admin must make the first connection, and each analyst needs the **Qlik MCP** permission under **Features and actions**, **Agentic AI**.
+
+Use this server alongside it for automation, CI, and the platform tools Qlik's server does not cover, where a service identity is what you want anyway.
 
 ## LangChain
 
