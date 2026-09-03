@@ -26,6 +26,68 @@ What is different here: a persistent engine session per app (no reconnect per ca
 
 Five of Qlik's tools have no public API behind them and are not implemented: the automation "run display" (use `qlik_get_automation_run_log`, the run's exported log), starting an interactive automation run and answering its input prompt, connector webhook configuration, and browsing the tables of a data connection. `qlik_get_automation_inputs` is best effort, read from the automation's workspace definition.
 
+### Which one to run
+
+| | Qlik's hosted server | This server |
+|---|---|---|
+| Identity | Each user, via OAuth | One service account |
+| Permissions | The signed-in user's own | The service account's |
+| Cost | Tenant question capacity, 5 tool calls per question | Ordinary API calls only |
+| Hosting | None, Qlik runs it | You run it |
+| Unattended use | Needs a human to finish the OAuth flow | Works in CI and on a schedule |
+| Availability | Requires the feature enabled and entitled on the tenant | Any tenant with API access |
+
+Running both is a sensible arrangement: Qlik's for interactive analyst work under each person's own permissions, this one for automation, CI, and tenants where the hosted feature is not enabled.
+
+### Connecting Claude Code to Qlik's hosted server
+
+You do not need this project to use Qlik's server. It is a standard remote MCP endpoint with OAuth, and Claude Code speaks that natively. Two prerequisites are admin work on the Qlik side:
+
+- A tenant admin must be the first person to connect each new MCP client type. That first connection establishes tenant-level trust for the client and the OAuth app; until it happens, everyone else's connection fails.
+- Each user needs the **Qlik MCP** permission set to **Allowed** under **Features and actions**, **Agentic AI**.
+
+If your tenant allows dynamic client registration, that is all the setup there is:
+
+```bash
+claude mcp add --transport http qlik-hosted https://<tenant>.<region>.qlikcloud.com/api/ai/mcp
+claude mcp login qlik-hosted
+```
+
+Claude Code discovers the authorization server, registers itself, opens a browser for the Qlik login, and stores the token in your keychain.
+
+If registration is closed, or you want a named client, have an admin create an OAuth client in the Administration activity center:
+
+- **Type:** Native or single-page application. Both are public clients using PKCE, so there is no secret to manage. Web type would force you to handle a client secret.
+- **Scopes:** `user_default` and `mcp:execute`. Add `offline_access` to drop re-authentication to once every 30 days.
+- **Redirect URI:** `http://localhost:8080/callback`, matching the port pinned below.
+
+```bash
+claude mcp add --transport http \
+  --client-id <CLIENT_ID> --callback-port 8080 \
+  qlik-hosted https://<tenant>.<region>.qlikcloud.com/api/ai/mcp
+claude mcp login qlik-hosted
+```
+
+Or commit it to a project `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "qlik-hosted": {
+      "type": "http",
+      "url": "https://<tenant>.<region>.qlikcloud.com/api/ai/mcp",
+      "oauth": { "clientId": "<CLIENT_ID>", "callbackPort": 8080 }
+    }
+  }
+}
+```
+
+The `--callback-port` flag is the part people miss. Without it Claude Code picks a random port each time, and a pre-registered redirect URI can never match.
+
+One trap worth naming: the client ID Qlik publishes for Claude Desktop, the one starting `76d3f46e`, is registered against `https://claude.ai/api/mcp/auth_callback`. It will not work from Claude Code, which calls back to localhost. Create your own client. Qlik's documentation names Claude Desktop and ChatGPT specifically; Claude Code follows their instructions for other LLM clients.
+
+See Qlik's [connection guide](https://help.qlik.com/en-US/cloud-services/Subsystems/Hub/Content/Sense_Hub/QlikMCP/Connecting-Qlik-MCP-server.htm) and [tenant deployment guide](https://help.qlik.com/en-US/cloud-services/Subsystems/Hub/Content/Sense_Hub/QlikMCP/Administering-Qlik-MCP.htm).
+
 ## Tools
 
 All tools return a JSON object. On failure it contains an `error` and usually a `hint`, so the agent can recover instead of crashing. Read-only tools carry the MCP `readOnlyHint` annotation, delete tools carry `destructiveHint`, and the selection tools are marked as session-state changes. `qlik-mcp-server --list-tools` prints the catalog for your configuration.
@@ -137,7 +199,7 @@ Set a bearer token whenever the HTTP endpoint is reachable beyond localhost; wit
 
 ## Claude Code
 
-Register the server from the project directory:
+Register this server from the project directory. To point Claude Code at Qlik's hosted server instead, see [Connecting Claude Code to Qlik's hosted server](#connecting-claude-code-to-qliks-hosted-server) above.
 
 ```bash
 claude mcp add qlik-cloud -e QLIK_TENANT_URL=https://your-tenant.us.qlikcloud.com -e QLIK_API_KEY=your-api-key -e QLIK_MCP_PROFILE=analytics -- python -m qlik_mcp_server
